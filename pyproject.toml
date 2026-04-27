@@ -1,0 +1,23 @@
+[project]
+name = "draxil-rag"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "docling",
+    "langchain",
+    "langchain-text-splitters",
+    "langchain-community",
+    "FlagEmbedding",
+    "qdrant-client",
+    "ollama",
+    "sentence-transformers",
+    "python-dotenv",
+    "unstructured[all-docs]",
+    "torch",
+]
+
+[tool.uv]
+package = false
+dev-dependencies = [
+    "pytest",
+]
