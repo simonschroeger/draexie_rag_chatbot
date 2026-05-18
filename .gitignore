@@ -32,7 +32,4 @@ data/qdrant/
 data/qdrant_storage/
 data/cloud_cache/
 
-# Custom UI backups
-frontend/new frontend/
-frontend/new\ frontend/
 
