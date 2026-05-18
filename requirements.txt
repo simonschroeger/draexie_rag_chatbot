@@ -1,10 +1,6 @@
 langchain
 langchain-core
 langchain_community
-langchain-openai
-langchain-mistralai
-openai
-mistralai
 chromadb
 sentence-transformers
 pypdf
@@ -20,7 +16,3 @@ uvicorn
 streamlit
 tqdm
 requests
-
-
-/Users/mateobajer/Rag Project/Screenshot
-/Users/mateobajer/Rag Project/assets/Screenshot 2026-04-27 at 19.20.22.png

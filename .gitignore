@@ -1,3 +1,38 @@
+# Virtual Environments
 .venv/
+venv/
+env/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment Variables
+.env
+.env.local
+
+# Databases and Storage
+*.db
+*.sqlite
+*.sqlite3
+conversations.db
+draxie.db
+
+# Vector Store and Cache Data
+data/qdrant/
+data/qdrant_storage/
+data/cloud_cache/
+
+# Custom UI backups
+frontend/new frontend/
+frontend/new\ frontend/
+
