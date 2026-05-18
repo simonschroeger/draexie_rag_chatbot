@@ -32,4 +32,5 @@ data/qdrant/
 data/qdrant_storage/
 data/cloud_cache/
 
-
+frontend_backup/
+data/

@@ -21,6 +21,10 @@ dependencies = [
     "python-multipart",
     "python-dotenv",
     "torch",
+    "tiktoken",
+    "xlrd",
+    "openpyxl",
+    "wand>=0.7.0",
 ]
 
 [tool.uv]
