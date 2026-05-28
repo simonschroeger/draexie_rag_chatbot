@@ -1,7 +1,14 @@
+// ── Mascot API (injected by draexie-mascot.js) ─────────────────────────────
+declare const mascot: {
+  setState(name: string, variant?: number): void;
+  readonly state: string;
+  readonly caption: string;
+};
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 interface Chunk        { num: number; source: string; text: string; }
-interface ServerEvent  { sources?: string[]; chunks?: Chunk[]; token?: string; done?: boolean; }
+interface ServerEvent  { sources?: string[]; chunks?: Chunk[]; token?: string; done?: boolean; suggestions?: string[]; error?: string; }
 interface Conversation { id: string; title: string; created_at: string; message_count: number; }
 interface Message      { role: "user" | "assistant"; content: string; }
 
@@ -217,7 +224,24 @@ function createAiMessage(): { wrapper: HTMLElement; bubble: HTMLElement } {
 
   const avatar = document.createElement("div");
   avatar.className = "ai-avatar";
-  avatar.innerHTML = `<span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;font-size:14px;">smart_toy</span>`;
+  avatar.innerHTML = `<svg viewBox="-60 -80 120 150" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:100%;overflow:visible">
+    <defs>
+      <linearGradient id="avBG${Math.random().toString(36).slice(2,6)}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--m-body-2)"/><stop offset="100%" stop-color="var(--m-body)"/>
+      </linearGradient>
+    </defs>
+    <line x1="0" y1="-60" x2="0" y2="-74" stroke="var(--m-body-2)" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="0" cy="-77" r="4" fill="var(--m-trim)" style="filter:drop-shadow(0 0 3px var(--m-trim))"/>
+    <rect x="-40" y="-58" width="80" height="60" rx="15" fill="var(--m-body)"/>
+    <path d="M -30 -44 L 30 -44 Q 33 -44 33 -41 L 33 -20 Q 33 -17 30 -17 L -30 -17 Q -33 -17 -33 -20 L -33 -41 L -30 -44 Z" fill="var(--m-visor)"/>
+    <circle cx="-13" cy="-31" r="5" fill="var(--m-trim)" style="filter:drop-shadow(0 0 3px var(--m-trim))"/>
+    <circle cx="13"  cy="-31" r="5" fill="var(--m-trim)" style="filter:drop-shadow(0 0 3px var(--m-trim))"/>
+    <rect x="-7" y="2" width="14" height="6" rx="1" fill="var(--m-body-2)"/>
+    <rect x="-33" y="8" width="66" height="45" rx="10" fill="var(--m-body)"/>
+    <circle cx="-8" cy="30" r="2.5" fill="var(--m-trim)" style="filter:drop-shadow(0 0 2px var(--m-trim))"/>
+    <circle cx="0"  cy="30" r="2.5" fill="var(--m-accent)"/>
+    <circle cx="8"  cy="30" r="2.5" fill="var(--m-spark)"/>
+  </svg>`;
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
@@ -309,6 +333,33 @@ function appendFeedback(wrapper: HTMLElement, question: string, getAnswer: () =>
   wrapper.appendChild(row);
 }
 
+// ── Suggested follow-up questions ─────────────────────────────────────────
+
+function appendSuggestions(questions: string[], container: HTMLElement): void {
+  if (!questions.length) return;
+
+  const row = document.createElement("div");
+  row.className = "follow-up-suggestions";
+
+  for (const q of questions) {
+    const btn = document.createElement("button");
+    btn.className = "suggestion follow-up";
+    btn.textContent = q;
+    btn.addEventListener("click", () => {
+      inputEl.value = q;
+      sendBtn.disabled = false;
+      inputEl.style.height = "auto";
+      inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + "px";
+      inputEl.focus();
+      sendMessage();
+    });
+    row.appendChild(btn);
+  }
+
+  container.appendChild(row);
+  scrollToBottom();
+}
+
 // ── Core: send & stream ────────────────────────────────────────────────────
 
 async function sendMessage(): Promise<void> {
@@ -323,6 +374,7 @@ async function sendMessage(): Promise<void> {
 
   removeWelcome();
   appendUserMessage(question);
+  mascot.setState("searching");
 
   const { wrapper, bubble } = createAiMessage();
   const cursor = bubble.querySelector(".cursor")!;
@@ -330,6 +382,7 @@ async function sendMessage(): Promise<void> {
   let chunks:  Chunk[]   = [];
   let answer             = "";
   let firstToken         = true;
+  let currentWrapper     = wrapper;
 
   try {
     const response = await fetch("/chat", {
@@ -344,14 +397,9 @@ async function sendMessage(): Promise<void> {
     const decoder = new TextDecoder();
     let buffer    = "";
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split("\n\n");
-      buffer = events.pop() ?? "";
-
+    const processEvents = (raw: string) => {
+      const events = raw.split("\n\n");
+      const remainder = events.pop() ?? "";
       for (const event of events) {
         if (!event.startsWith("data: ")) continue;
         let parsed: ServerEvent;
@@ -360,24 +408,49 @@ async function sendMessage(): Promise<void> {
         if (parsed.sources) {
           sources = parsed.sources;
           chunks  = parsed.chunks ?? [];
+          mascot.setState("analyzing");
         } else if (parsed.token !== undefined) {
-          if (firstToken) { bubble.innerHTML = ""; bubble.appendChild(cursor); firstToken = false; }
+          if (firstToken) {
+            bubble.innerHTML = "";
+            bubble.appendChild(cursor);
+            firstToken = false;
+            mascot.setState("generating");
+          }
           answer += parsed.token;
           cursor.insertAdjacentText("beforebegin", parsed.token);
           scrollToBottom();
         } else if (parsed.done) {
           cursor.remove();
-          appendSources(wrapper, sources, chunks);
-          appendFeedback(wrapper, question, () => answer);
+          mascot.setState("found");
+          appendSources(currentWrapper, sources, chunks);
+          appendFeedback(currentWrapper, question, () => answer);
+          if (parsed.suggestions?.length) {
+            appendSuggestions(parsed.suggestions, currentWrapper);
+          }
           scrollToBottom();
           loadConversationList();
+          setTimeout(() => mascot.setState("idle"), 3000);
         }
       }
+      return remainder;
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        // flush any remaining buffered data before closing
+        if (buffer.trim()) processEvents(buffer + "\n\n");
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      buffer = processEvents(buffer);
     }
   } catch (err) {
     cursor.remove();
+    mascot.setState("error");
     bubble.textContent = "Verbindungsfehler. Bitte versuche es erneut.";
     console.error(err);
+    setTimeout(() => mascot.setState("idle"), 4000);
   }
 
   inputEl.disabled = false;

@@ -218,6 +218,35 @@ _expand_chain = (
     | StrOutputParser()
 )
 
+_suggest_chain = (
+    ChatPromptTemplate.from_template(
+        "You are a DRÄXLMAIER sales onboarding assistant.\n"
+        "Based on the context and answer below, generate exactly 3 short follow-up questions "
+        "in the same language as the answer, that the user might ask next and that are answerable from the context.\n"
+        "Return ONLY a JSON array, e.g.: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]\n\n"
+        "Context:\n{context}\n\nAnswer:\n{answer}"
+    )
+    | ChatOllama(
+        base_url=config.OLLAMA_BASE_URL,
+        model=config.LLM_MODEL,
+        temperature=0.1,
+    )
+    | StrOutputParser()
+)
+
+
+def _parse_suggestions(raw: str) -> list[str]:
+    """Extract JSON array of strings from LLM output, tolerating surrounding text."""
+    start = raw.find("[")
+    end   = raw.rfind("]")
+    if start == -1 or end == -1:
+        return []
+    try:
+        items = json.loads(raw[start:end + 1])
+        return [s for s in items if isinstance(s, str)][:3]
+    except Exception:
+        return []
+
 def multi_retrieve(question: str):
     extras = _expand_chain.invoke({"question": question})
     queries = [question] + [q.strip() for q in extras.splitlines() if q.strip()]
@@ -235,13 +264,32 @@ def format_docs(docs) -> str:
 
 
 _SYSTEM_PROMPT = """\
-Du bist DRÄXIE, ein präziser Assistent an der Hochschule Landshut.
-Beantworte Fragen ausschließlich auf Basis der bereitgestellten Kontext-Abschnitte.
-Wenn nach konkreten Zahlen, ECTS-Punkten, Fristen oder Listen gefragt wird, nenne diese direkt.
-Zitiere bei jeder Aussage die Quelle mit [N] (z. B. [1], [2]).
-Wenn die Antwort nicht im Kontext steht:
-"Diese Information wurde in den Dokumenten nicht gefunden."
-Antworte auf Deutsch. Beziehe dich auf frühere Nachrichten wenn relevant.\
+You are DRÄXIE, a precise onboarding assistant for DRÄXLMAIER sales staff.
+
+GROUNDING RULES
+- Answer using only the information in the provided context sections.
+- Cite every factual statement with its source marker [N] (e.g. [1], [2]).
+- When asked for specific numbers, deadlines, names, or lists, state them directly and exactly as they appear in the context.
+
+WHEN THE CONTEXT IS INCOMPLETE
+- If the context fully answers the question, answer completely.
+- If the context only partially answers it, give what the context supports, then clearly state what is missing — e.g. "The context covers X but does not specify Y."
+- If the context does not answer the question at all, say so plainly and do not guess. Never fill gaps with outside knowledge or assumptions.
+
+FORMAT
+- Default to clear prose. Use a table or bullet list only when the content is genuinely a list, comparison, or set of steps — not for single facts.
+- When the answer is best shown as a table, emit a fenced block with this EXACT syntax (nothing else inside the fence):
+  ```ui-table
+    {{"title": "optional title", "columns": ["Col A", "Col B"], "rows": [["Val 1", "Val 2"], ["Val 3", "Val 4"]]}}
+  ```
+  Put normal prose before and after the block. Only use it for genuine tabular data.
+- [N] markers correspond to the numbered context sections provided.
+
+LANGUAGE
+- Always reply in the same language as the user's question. German question → German answer. English question → English answer.
+
+CONVERSATION
+- Use earlier messages in the conversation for context when relevant.
 """
 
 _answer_prompt = ChatPromptTemplate.from_messages([
@@ -268,7 +316,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="frontend"), name="static")
+app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
+
+# Serve extracted images; create dir at startup so StaticFiles doesn't error
+_images_dir = Path(config.IMAGE_STORE_PATH)
+_images_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/images", StaticFiles(directory=str(_images_dir)), name="images")
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -289,7 +342,18 @@ class FeedbackRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return FileResponse("frontend/index.html")
+    return FileResponse("frontend/dist/index.html")
+
+
+@app.get("/draexie-mascot.js")
+async def mascot_js():
+    return FileResponse("frontend/dist/draexie-mascot.js", media_type="application/javascript")
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa_fallback(full_path: str):
+    """Serve React SPA for all non-API routes."""
+    return FileResponse("frontend/dist/index.html")
 
 
 @app.post("/chat")
@@ -301,12 +365,19 @@ def chat(req: ChatRequest):
         Path(d.metadata.get("source", "unknown")).name for d in docs
     ))
 
-    # Chunks: numbered text previews for citation popout
+    # Chunks: numbered text previews + optional image URL for figure chunks
     chunks = [
         {
             "num": i + 1,
             "source": Path(d.metadata.get("source", "unknown")).name,
             "text": d.page_content[:500],
+            "image_url": (
+                f"/images/{Path(d.metadata['image_path']).name}"
+                if d.metadata.get("chunk_type") == "figure"
+                   and d.metadata.get("image_path")
+                   and Path(d.metadata["image_path"]).exists()
+                else None
+            ),
         }
         for i, d in enumerate(docs)
     ]
@@ -360,14 +431,24 @@ def chat(req: ChatRequest):
             history_obj.add_ai_message(full_answer)
 
         else:
-            # ── Text-only path (identical to original) ────────────────────────
+            # ── Text-only path ────────────────────────────────────────────────
+            full_answer = ""
             for token in _chain_with_history.stream(
                 {"context": context, "question": req.question},
                 config={"configurable": {"session_id": req.conversation_id}},
             ):
+                full_answer += token
                 yield f"data: {json.dumps({'token': token})}\n\n"
 
-        yield f"data: {json.dumps({'done': True})}\n\n"
+        # ── Suggested follow-up questions (generated before done) ────────────
+        suggestions: list[str] = []
+        try:
+            raw = _suggest_chain.invoke({"context": context, "answer": full_answer})
+            suggestions = _parse_suggestions(raw)
+        except Exception:
+            pass
+
+        yield f"data: {json.dumps({'done': True, 'suggestions': suggestions})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

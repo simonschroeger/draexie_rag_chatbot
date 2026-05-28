@@ -737,3 +737,95 @@ textarea::-webkit-scrollbar-thumb { background: var(--bg4); }
   .sources { margin-left: 0; }
   .feedback-row { margin-left: 0; }
 }
+
+/* ── Mascot CSS vars ──────────────────────────────────────────── */
+:root {
+  --m-trim:   var(--accent);
+  --m-body:   var(--bg3);
+  --m-body-2: var(--bg4);
+  --m-visor:  var(--bg);
+  --m-eye:    var(--accent);
+  --m-accent: #d0bcff;
+  --m-spark:  #ffda51;
+  --m-error:  #ffb4ab;
+}
+
+/* SVG fill/stroke utility classes */
+.m-trim    { fill: var(--m-trim); }
+.m-body    { fill: var(--m-body); }
+.m-body-2  { fill: var(--m-body-2); }
+.m-visor   { fill: var(--m-visor); }
+.m-eye     { fill: var(--m-eye); }
+.m-accent  { fill: var(--m-accent); }
+.m-spark   { fill: var(--m-spark); }
+.m-error   { fill: var(--m-error); }
+
+.glow        { filter: drop-shadow(0 0 4px var(--m-trim)); }
+.strong-glow { filter: drop-shadow(0 0 8px var(--m-trim)); }
+
+/* ── Floating mascot above input ─────────────────────────────── */
+.dxm-floating {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+  padding-bottom: 4px;
+}
+
+.dxm-floating svg {
+  width: 160px;
+  height: 160px;
+  overflow: visible;
+}
+
+.dxm-caption {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--accent);
+  letter-spacing: 0.06em;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+}
+
+/* ── Avatar mascot in chat messages ──────────────────────────── */
+.ai-avatar svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+/* ── Follow-up suggestion chips ──────────────────────────────── */
+.follow-up-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0 4px 0;
+  grid-template-columns: unset;
+}
+
+.suggestion.follow-up {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  padding: 7px 14px;
+  background: transparent;
+  border: 1px solid rgba(82,241,252,0.3);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 400;
+  font-family: var(--mono);
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  text-align: left;
+}
+
+.suggestion.follow-up:hover {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
