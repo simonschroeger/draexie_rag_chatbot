@@ -3,179 +3,115 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
 
 from pypdf import PdfReader
 
 
-@dataclass(frozen=True)
-class PdfTestCase:
-    id: str
-    source: str
-    question: str
-    expected_any: list[str]
-    excerpt: str
+NOT_FOUND_PHRASES = [
+    "nicht gefunden",
+    "konnte nicht",
+    "keine information",
+    "no information",
+    "not found",
+]
 
 
-STOPWORDS = {
-    "aber", "alle", "als", "auch", "auf", "aus", "bei", "das", "dem", "den",
-    "der", "des", "die", "ein", "eine", "einer", "eines", "für", "fuer",
-    "ist", "mit", "nach", "oder", "sich", "sind", "und", "von", "zur", "zum",
-}
+def read_input(path: Path) -> str:
+    if path.suffix.lower() == ".pdf":
+        return read_pdf(path)
+
+    return path.read_text(encoding="utf-8")
 
 
-def find_pdfs(input_path: Path) -> list[Path]:
-    if input_path.is_file() and input_path.suffix.lower() == ".pdf":
-        return [input_path]
-
-    if input_path.is_dir():
-        return sorted(input_path.glob("*.pdf"))
-
-    return []
-
-
-def extract_text_from_pdf(pdf_path: Path) -> str:
-    reader = PdfReader(str(pdf_path))
-    parts = []
+def read_pdf(path: Path) -> str:
+    reader = PdfReader(str(path))
+    pages = []
 
     for page in reader.pages:
-        text = page.extract_text() or ""
-        parts.append(text)
+        pages.append(page.extract_text() or "")
 
-    return "\n".join(parts)
-
-
-def clean_text(text: str) -> str:
-    text = re.sub(r"-\s*\n\s*", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return "\n".join(pages)
 
 
-def split_into_sentences(text: str) -> list[str]:
-    text = clean_text(text)
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    return [s.strip() for s in sentences if 50 <= len(s.strip()) <= 400]
+def extract_questions(text: str) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    raw_questions = re.findall(r"[^?]+[?]", text)
 
+    questions = []
+    seen = set()
 
-def extract_keywords(sentence: str) -> list[str]:
-    keywords = []
+    for question in raw_questions:
+        question = clean_question(question)
 
-    important_patterns = [
-        r"\b\d+\s*(?:%|EUR|Euro|Tage|Wochen|Monate|Jahre)\b",
-        r"\b\d{1,2}\.\d{1,2}\.\d{4}\b",
-        r"\b\d{4}\b",
-    ]
-
-    for pattern in important_patterns:
-        for match in re.finditer(pattern, sentence, flags=re.IGNORECASE):
-            value = match.group(0).lower()
-            if value not in keywords:
-                keywords.append(value)
-
-    words = re.findall(r"[A-Za-zÄÖÜäöüß0-9]+", sentence)
-
-    for word in words:
-        word = word.lower()
-
-        if len(word) < 4:
+        if not question:
             continue
 
-        if word in STOPWORDS:
+        key = question.lower()
+
+        if key in seen:
             continue
 
-        if word not in keywords:
-            keywords.append(word)
+        seen.add(key)
+        questions.append(question)
 
-        if len(keywords) >= 6:
-            break
-
-    return keywords[:6]
+    return questions
 
 
-def make_question(sentence: str, source: str) -> str:
-    topic = sentence[:140].rstrip(" ,;:.")
-    return f"Was steht im Dokument {source} zu folgendem Inhalt: {topic}?"
+def clean_question(question: str) -> str:
+    question = question.strip()
+    question = re.sub(r"^\d+[\).\s-]+", "", question)
+    question = re.sub(r"^[A-Za-z]\)", "", question)
+    question = re.sub(r"\s+", " ", question)
+    return question.strip()
 
 
-def build_cases_for_pdf(pdf_path: Path, max_cases: int) -> list[PdfTestCase]:
-    text = extract_text_from_pdf(pdf_path)
-    sentences = split_into_sentences(text)
+def write_json(questions: list[str], output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    cases = []
-
-    for index, sentence in enumerate(sentences, start=1):
-        keywords = extract_keywords(sentence)
-
-        if not keywords:
-            continue
-
-        cases.append(
-            PdfTestCase(
-                id=f"{pdf_path.stem}_{index}",
-                source=pdf_path.name,
-                question=make_question(sentence, pdf_path.name),
-                expected_any=keywords,
-                excerpt=sentence,
-            )
-        )
-
-        if len(cases) >= max_cases:
-            break
-
-    return cases
-
-
-def write_json(cases: list[PdfTestCase], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    data = [
+    cases = [
         {
-            "id": case.id,
-            "source": case.source,
-            "question": case.question,
-            "expected_any": case.expected_any,
-            "excerpt": case.excerpt,
+            "id": f"question_{index}",
+            "question": question,
         }
-        for case in cases
+        for index, question in enumerate(questions, start=1)
     ]
 
-    output_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
+    output.write_text(
+        json.dumps(cases, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
 
-def write_pytest(cases: list[PdfTestCase], output_path: Path, min_score: int) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def write_pytest(questions: list[str], output: Path, min_score: int) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    cases_as_dicts = [
+    cases = [
         {
-            "id": case.id,
-            "source": case.source,
-            "question": case.question,
-            "expected_any": case.expected_any,
-            "excerpt": case.excerpt,
+            "id": f"question_{index}",
+            "question": question,
         }
-        for case in cases
+        for index, question in enumerate(questions, start=1)
     ]
 
-    cases_json = json.dumps(cases_as_dicts, ensure_ascii=False, indent=4)
+    cases_json = json.dumps(cases, ensure_ascii=False, indent=4)
+    not_found_json = json.dumps(NOT_FOUND_PHRASES, ensure_ascii=False, indent=4)
 
     content = f'''"""
-RAG Test Suite — Generated PDF Test Cases
-==========================================
-
-This file was generated from PDF documents.
-It checks whether the chatbot can answer questions based on the PDFs.
+RAG Test Suite — Generated Question Test Cases
+==============================================
+Questions are extracted from an input file by splitting at each question mark.
+Each test queries the live RAG pipeline and checks that the chatbot returns a
+usable answer.
 
 Run:
-    pytest {output_path} -v -s
+    pytest {output} -v -s
 """
 
-import pytest
-import sys
 import os
+import sys
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -183,6 +119,8 @@ from rag import RAGPipeline
 
 
 CASES = {cases_json}
+
+NOT_FOUND_PHRASES = {not_found_json}
 
 
 @pytest.fixture(scope="session")
@@ -195,20 +133,19 @@ def _answer(pipeline, question: str) -> str:
     return result["answer"].lower()
 
 
-def _case_passed(answer: str, expected_any: list[str]) -> bool:
-    return any(expected.lower() in answer for expected in expected_any)
+def _case_passed(answer: str) -> bool:
+    if not answer.strip():
+        return False
+
+    return not any(phrase in answer for phrase in NOT_FOUND_PHRASES)
 
 
-class TestGeneratedPdfCases:
+class TestGeneratedQuestions:
 
     @pytest.mark.parametrize("case", CASES, ids=lambda case: case["id"])
-    def test_single_case(self, pipeline, case):
+    def test_question_has_usable_answer(self, pipeline, case):
         ans = _answer(pipeline, case["question"])
-
-        assert _case_passed(ans, case["expected_any"]), (
-            f"Expected one of {{case['expected_any']}} in answer. "
-            f"Source: {{case['source']}}"
-        )
+        assert _case_passed(ans), f"No usable answer for question: {{case['question']}}"
 
     def test_chatbot_score_percentage(self, pipeline):
         passed = 0
@@ -217,7 +154,7 @@ class TestGeneratedPdfCases:
         for case in CASES:
             ans = _answer(pipeline, case["question"])
 
-            if _case_passed(ans, case["expected_any"]):
+            if _case_passed(ans):
                 passed += 1
 
         score = passed / total * 100 if total else 0
@@ -229,55 +166,67 @@ class TestGeneratedPdfCases:
         assert score >= {min_score}
 '''
 
-    output_path.write_text(content, encoding="utf-8")
+    output.write_text(content, encoding="utf-8")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input", help="PDF-Datei oder Ordner mit PDF-Dateien")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build RAG chatbot test cases from questions ending with '?'."
+    )
+
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="Text, Markdown, or PDF file with questions.",
+    )
+
     parser.add_argument(
         "--json-out",
-        default="generated_tests/pdf_test_cases.json",
-        help="JSON-Datei für die generierten Test-Cases",
+        type=Path,
+        default=Path("generated_tests/question_test_cases.json"),
+        help="Output JSON file for extracted questions.",
     )
+
     parser.add_argument(
         "--pytest-out",
-        default="tests/test_generated_pdf_cases.py",
-        help="Python pytest-Datei, die den Chatbot testet",
+        type=Path,
+        default=Path("tests/test_generated_questions.py"),
+        help="Output pytest file.",
     )
+
     parser.add_argument(
-        "--max-cases-per-pdf",
+        "--max-questions",
         type=int,
-        default=5,
-        help="Maximale Test-Cases pro PDF",
+        default=20,
+        help="Maximum number of questions to use.",
     )
+
     parser.add_argument(
         "--min-score",
         type=int,
         default=70,
-        help="Mindest-Score in Prozent, den der Chatbot erreichen muss",
+        help="Minimum percentage of usable chatbot answers required.",
     )
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    pdfs = find_pdfs(Path(args.input))
 
-    if not pdfs:
-        raise SystemExit("Keine PDF-Dateien gefunden.")
+def main() -> None:
+    args = parse_args()
 
-    all_cases = []
+    text = read_input(args.input)
+    questions = extract_questions(text)[: args.max_questions]
 
-    for pdf in pdfs:
-        cases = build_cases_for_pdf(pdf, args.max_cases_per_pdf)
-        all_cases.extend(cases)
-        print(f"{pdf.name}: {len(cases)} Test-Cases erstellt")
+    if not questions:
+        raise SystemExit("No questions ending with '?' found.")
 
-    write_json(all_cases, Path(args.json_out))
-    write_pytest(all_cases, Path(args.pytest_out), args.min_score)
+    write_json(questions, args.json_out)
+    write_pytest(questions, args.pytest_out, args.min_score)
 
-    print(f"\\nJSON gespeichert: {args.json_out}")
-    print(f"Pytest-Datei gespeichert: {args.pytest_out}")
-    print(f"Mindest-Score: {args.min_score}%")
+    print(f"Extracted questions: {len(questions)}")
+    print(f"JSON written to: {args.json_out}")
+    print(f"Pytest written to: {args.pytest_out}")
+    print(f"Minimum score: {args.min_score}%")
 
 
 if __name__ == "__main__":
