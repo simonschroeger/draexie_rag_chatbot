@@ -86,87 +86,139 @@ def write_json(questions: list[str], output: Path) -> None:
 def write_pytest(questions: list[str], output: Path, min_score: int) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    cases = [
-        {
-            "id": f"question_{index}",
-            "question": question,
-        }
-        for index, question in enumerate(questions, start=1)
+    lines = [
+        '"""',
+        "RAG Test Suite — Generated Question Test Cases",
+        "================================================",
+        "Questions are extracted from an input file by splitting at each question mark.",
+        "Each test queries the live RAG pipeline and checks that the chatbot returns a",
+        "usable answer.",
+        "",
+        "Run:",
+        f"    pytest {output} -v -s",
+        '"""',
+        "",
+        "import pytest",
+        "import sys",
+        "import os",
+        "",
+        "sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))",
+        "",
+        "from rag import RAGPipeline",
+        "",
+        "",
+        "# ── Shared pipeline fixture (loaded once per session) ─────────────────────────",
+        "",
+        '@pytest.fixture(scope="session")',
+        "def pipeline():",
+        "    return RAGPipeline()",
+        "",
+        "",
+        "def _answer(pipeline, question: str) -> str:",
+        "    result = pipeline.query(question, skip_verify=True)",
+        '    return result["answer"].lower()',
+        "",
+        "",
+        "def _case_passed(answer: str) -> bool:",
+        "    if not answer.strip():",
+        "        return False",
+        f"    not_found_phrases = {json.dumps(NOT_FOUND_PHRASES, ensure_ascii=False)}",
+        "    return not any(phrase in answer for phrase in not_found_phrases)",
+        "",
+        "",
+        "# ══════════════════════════════════════════════════════════════════════════════",
+        "# GROUP 1 — Generated questions",
+        "# ══════════════════════════════════════════════════════════════════════════════",
+        "",
+        "class TestGeneratedQuestions:",
+        "",
     ]
 
-    cases_json = json.dumps(cases, ensure_ascii=False, indent=4)
-    not_found_json = json.dumps(NOT_FOUND_PHRASES, ensure_ascii=False, indent=4)
+    for index, question in enumerate(questions, start=1):
+        test_name = make_test_name(question, index)
+        question_literal = json.dumps(question, ensure_ascii=False)
+        docstring = question.replace('"""', "'")
 
-    content = f'''"""
-RAG Test Suite — Generated Question Test Cases
-==============================================
-Questions are extracted from an input file by splitting at each question mark.
-Each test queries the live RAG pipeline and checks that the chatbot returns a
-usable answer.
+        lines.extend(
+            [
+                f"    def {test_name}(self, pipeline):",
+                f'        """{docstring}"""',
+                f"        ans = _answer(pipeline,",
+                f"            {question_literal})",
+                "        assert _case_passed(ans)",
+                "",
+            ]
+        )
 
-Run:
-    pytest {output} -v -s
-"""
+    lines.extend(
+        [
+            "    def test_chatbot_score_percentage(self, pipeline):",
+            f'        """At least {min_score}% of generated questions must return a usable answer."""',
+            "        passed = 0",
+            f"        total = {len(questions)}",
+            "",
+        ]
+    )
 
-import os
-import sys
+    for question in questions:
+        question_literal = json.dumps(question, ensure_ascii=False)
 
-import pytest
+        lines.extend(
+            [
+                "        ans = _answer(pipeline,",
+                f"            {question_literal})",
+                "        if _case_passed(ans):",
+                "            passed += 1",
+                "",
+            ]
+        )
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    lines.extend(
+        [
+            "        score = passed / total * 100 if total else 0",
+            '        print(f"Chatbot Score: {score:.1f}%")',
+            '        print(f"Passed: {passed}/{total}")',
+            f"        assert score >= {min_score}",
+            "",
+        ]
+    )
 
-from rag import RAGPipeline
-
-
-CASES = {cases_json}
-
-NOT_FOUND_PHRASES = {not_found_json}
-
-
-@pytest.fixture(scope="session")
-def pipeline():
-    return RAGPipeline()
-
-
-def _answer(pipeline, question: str) -> str:
-    result = pipeline.query(question, skip_verify=True)
-    return result["answer"].lower()
-
-
-def _case_passed(answer: str) -> bool:
-    if not answer.strip():
-        return False
-
-    return not any(phrase in answer for phrase in NOT_FOUND_PHRASES)
+    output.write_text("\n".join(lines), encoding="utf-8")
 
 
-class TestGeneratedQuestions:
+def make_test_name(question: str, index: int) -> str:
+    words = re.findall(r"[a-zA-Z0-9äöüÄÖÜß]+", question.lower())
 
-    @pytest.mark.parametrize("case", CASES, ids=lambda case: case["id"])
-    def test_question_has_usable_answer(self, pipeline, case):
-        ans = _answer(pipeline, case["question"])
-        assert _case_passed(ans), f"No usable answer for question: {{case['question']}}"
+    ignored_words = {
+        "welche",
+        "welcher",
+        "welches",
+        "warum",
+        "wieso",
+        "wann",
+        "wird",
+        "werden",
+        "kann",
+        "können",
+        "sind",
+        "eine",
+        "einer",
+        "eines",
+    }
 
-    def test_chatbot_score_percentage(self, pipeline):
-        passed = 0
-        total = len(CASES)
+    useful_words = [
+        word
+        for word in words
+        if len(word) >= 4 and word not in ignored_words
+    ]
 
-        for case in CASES:
-            ans = _answer(pipeline, case["question"])
+    name = "_".join(useful_words[:6]) or f"frage_{index}"
+    name = re.sub(r"[^a-z0-9_]+", "_", name).strip("_")
 
-            if _case_passed(ans):
-                passed += 1
+    if not name or name[0].isdigit():
+        name = f"frage_{index}_{name}"
 
-        score = passed / total * 100 if total else 0
-
-        print()
-        print(f"Chatbot Score: {{score:.1f}}%")
-        print(f"Passed: {{passed}}/{{total}}")
-
-        assert score >= {min_score}
-'''
-
-    output.write_text(content, encoding="utf-8")
+    return f"test_{name[:70]}"
 
 
 def parse_args() -> argparse.Namespace:
