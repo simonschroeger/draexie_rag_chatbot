@@ -318,10 +318,15 @@ app.add_middleware(
 
 app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
 
-# Serve extracted images; create dir at startup so StaticFiles doesn't error
+# Serve extracted images
 _images_dir = Path(config.IMAGE_STORE_PATH)
 _images_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(_images_dir)), name="images")
+
+# Serve original uploaded files so the in-app document viewer can open them
+_uploads_dir = Path("./data/uploads")
+_uploads_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(_uploads_dir)), name="uploads")
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -522,10 +527,14 @@ def feedback(req: FeedbackRequest):
 
 # ── Document upload ───────────────────────────────────────────────────────────
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp"}
 
 
 def _ingest_file(tmp_path: str, original_name: str) -> None:
+    # Keep a copy so the document viewer can serve the original file
+    upload_copy = _uploads_dir / original_name
+    upload_copy.write_bytes(Path(tmp_path).read_bytes())
+
     con = sqlite3.connect(META_DB)
     try:
         result  = _converter.convert(tmp_path)
