@@ -11,7 +11,7 @@ export const ArtifactRenderer: React.FC<ArtifactRendererProps> = ({ artifact }) 
 
   if (type === 'component') {
     if (name === 'AcquisitionTimeline') {
-      return <TimelineArtifact data={data} />;
+      return <TimelineArtifact data={data as Parameters<typeof TimelineArtifact>[0]['data']} />;
     }
     // Add more component-based artifacts here
     return (

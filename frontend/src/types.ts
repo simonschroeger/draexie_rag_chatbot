@@ -37,6 +37,27 @@ export interface ServerEvent {
   suggestions?: string[];
 }
 
+export interface Milestone {
+  id: string;
+  title: string;
+  date: string;
+  description: string;
+  status: 'completed' | 'in-progress' | 'pending';
+  risk_level?: 'high' | 'medium' | 'low';
+}
+
+export interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  artifact?: {
+    type: string;
+    name: string;
+    data?: unknown;
+    content?: string;
+  };
+}
+
 declare global {
   interface Window {
     mascot?: {

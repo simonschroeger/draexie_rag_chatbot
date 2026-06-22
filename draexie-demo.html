@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DRÄXIE — System Architecture</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #09090b; color: #fafafa; font-family: 'Inter', sans-serif; padding: 2rem; }
+    h1 { font-size: 1.4rem; color: #3b82f6; margin-bottom: 0.25rem; letter-spacing: 0.05em; }
+    .subtitle { font-size: 0.75rem; color: #52525b; margin-bottom: 2rem; font-family: monospace; }
+    .diagram-wrap { background: #101014; border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 2rem; margin-bottom: 2rem; }
+    .diagram-wrap h2 { font-size: 0.85rem; color: #a1a1aa; margin-bottom: 1.5rem; text-transform: uppercase; letter-spacing: 0.1em; border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 0.75rem; }
+    .mermaid { display: flex; justify-content: center; }
+    .legend { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.06); }
+    .legend-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.72rem; color: #a1a1aa; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+  </style>
+</head>
+<body>
+  <h1>DRÄXIE — End-to-End System Architecture</h1>
+  <p class="subtitle">FastAPI · LangChain · Qdrant · Gemma4 27B MoE · BGE-M3 · React/Vite</p>
+
+  <!-- ── DIAGRAM 1: End-to-End Flow ── -->
+  <div class="diagram-wrap">
+    <h2>1 · End-to-End System Overview</h2>
+    <div class="mermaid">
+flowchart TD
+    User(["👤 DRÄXLMAIER\nSales Staff"])
+
+    subgraph FE["FRONTEND  —  React + Vite + Tailwind v4"]
+        direction TB
+        UI_Chat["Chat Interface\n─────────────\n• Streaming message bubbles\n• Citation badges [N]\n• Amber border for no-answer\n• Suggestion chips\n• Mascot animation (GSAP)"]
+        UI_Side["Sidebar\n─────────────\n• Conversation list (grouped by date)\n• Cross-chat keyword search + excerpts\n• Double-click rename\n• Light / Dark mode toggle\n• Gesprächskontext: N Nachrichten\n• One-time onboarding tooltip"]
+        UI_Panel["Knowledge Panel\n─────────────\n• Numbered sources w/ citation badges\n• Chunk text preview + image display\n• Scroll-to-chunk on [N] badge click\n• DocViewer (original file)"]
+        UI_Upload["Upload\n─────────────\n• Drag-and-drop\n• Paperclip button\n• Ingestion status polling"]
+    end
+
+    subgraph BE["BACKEND  —  FastAPI  (uvicorn --reload  ·  port 8000)"]
+        direction TB
+        subgraph INGEST["Document Ingestion Pipeline  (POST /documents → background task)"]
+            direction LR
+            ING1["Docling\nDocumentConverter\n(.pdf .docx .pptx\n.xlsx .txt .png)"] --> ING2["HybridChunker\n+ contextualize()"]
+            ING2 --> ING3{"chunk_type?"}
+            ING3 -->|"text / table"| ING4["RecursiveCharacter\nTextSplitter\nchunk=800 overlap=100"]
+            ING3 -->|"figure / chart"| ING5["_extract_images()\n→ PNG → data/images/"]
+            ING5 --> ING6["_describe_image()\nGemma4 Vision\n→ German description\n(Zahlen, Art, Inhalt)"]
+            ING4 --> ING7["BGE-M3 dense\n+ BM25 sparse\nembed"]
+            ING6 --> ING7
+            ING7 --> ING8[("Qdrant\n.add_documents()")]
+        end
+        subgraph DOCX["DOCX Hyperlink Extraction"]
+            DX1["_extract_docx_links()\npython-docx\n→ hyperlink chunk\n(chunk_type=text)"]
+        end
+        subgraph RAG["RAG Query Pipeline  (POST /chat → StreamingResponse SSE)"]
+            direction LR
+            RAG1["Multi-Query Expansion\n_expand_chain\n→ 2 alt. phrasings\nvia Gemma4"] --> RAG2["Hybrid Retrieval\n× 3 queries\nBGE-M3 dense +\nBM25 sparse + RRF"]
+            RAG2 --> RAG3["Typed Sort\ntext_docs[:6]\nfigure_docs[:2]\n(text always first)"]
+            RAG3 --> RAG4["format_docs()\n[N] numbered context\nfor prompt"]
+            RAG4 --> RAG5["ChatPromptTemplate\n+ MessagesPlaceholder\n(full conversation history)"]
+            RAG5 --> RAG6["Gemma4 26B MoE\nstreaming\ntemp=0.3  repeat_penalty=1.15\nnum_predict=1024"]
+            RAG6 --> RAG7["_suggest_chain\n3 follow-up questions\n(same language)"]
+        end
+        subgraph CONV["Conversation & Source Persistence"]
+            CV1[("conversations.db\nSQLite\n───────────\nmessage_store\nmessage_sources\nconversation_titles")]
+            CV2["SQLChatMessageHistory\n(LangChain)"]
+            CV3["POST /conversations/{id}/title\n6-word German title\nstored on first AI response"]
+            CV4["GET /conversations/search\nSQLite LIKE on message_store\n→ excerpt + match position"]
+        end
+    end
+
+    subgraph STORE["STORAGE  —  Local Disk"]
+        ST1[("Qdrant\nlocal persistent\n14,799 chunks\ncollection: draxil_rag")]
+        ST2[("data/uploads/\noriginal files")]
+        ST3[("data/images/\n6,469 PNGs\nextracted figures")]
+        ST4[("draxie.db\nSQLite\n───────────\ningestion_log\nfeedback")]
+    end
+
+    subgraph OLLAMA["OLLAMA  —  Local GPU  (NVIDIA RTX 4090 · 24 GB VRAM)"]
+        OL1["gemma4:26b-a4b-it-q4_K_M\n─────────────────────────\n• Chat generation (streaming)\n• Vision — image descriptions\n• Multi-query expansion\n• Conversation title generation\n• Follow-up suggestion generation"]
+    end
+
+    subgraph EMBED["EMBEDDINGS  —  Local"]
+        EM1["HuggingFace BGE-M3\n(dense · 1024-dim)"]
+        EM2["FastEmbed Qdrant/BM25\n(sparse)"]
+    end
+
+    User <-->|"HTTP + SSE\nport 5173"| FE
+    FE <-->|"REST API\nport 8000"| BE
+    BE <-->|"qdrant-client\nlocal path"| ST1
+    BE <-->|"file I/O"| ST2
+    BE <-->|"file I/O"| ST3
+    BE <-->|"sqlite3"| CV1
+    BE <-->|"sqlite3"| ST4
+    BE <-->|"POST /api/chat\nport 11434"| OLLAMA
+    BE --> EMBED
+    EMBED -->|"vectors"| ST1
+    </div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>Frontend (React + Vite)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#8b5cf6"></div>FastAPI Backend</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#10b981"></div>Local Storage (Qdrant · SQLite · Disk)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>Ollama — Gemma4 26B MoE (GPU)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>Embeddings (BGE-M3 + BM25)</div>
+    </div>
+  </div>
+
+  <!-- ── DIAGRAM 2: API Surface ── -->
+  <div class="diagram-wrap">
+    <h2>2 · API Endpoints</h2>
+    <div class="mermaid">
+flowchart LR
+    subgraph CHAT["Chat"]
+        A1["POST /chat\n→ SSE stream\n  · {token}\n  · {sources, chunks}\n  · {suggestions}\n  · {done}"]
+    end
+    subgraph CONVAPI["Conversations"]
+        B1["GET /conversations\n→ list w/ titles + msg count"]
+        B2["DELETE /conversations/{id}"]
+        B3["GET /conversations/search?q=\n→ excerpt + match_start/len"]
+        B4["POST /conversations/{id}/title\n→ AI-generated German title"]
+        B5["GET /conversations/{id}/messages\n→ messages + sources + chunks"]
+    end
+    subgraph DOCS["Documents"]
+        C1["POST /documents (multipart)\n→ background ingest task"]
+        C2["GET /documents/status\n→ last 20 ingestion_log rows"]
+        C3["GET /uploads/{filename}\n→ original file (FileResponse)"]
+        C4["GET /images/{filename}\n→ extracted PNG (FileResponse)"]
+    end
+    subgraph ADMIN["Admin / Health"]
+        D1["POST /feedback → draxie.db"]
+        D2["GET /health\n→ {qdrant ok+count,\n   ollama ok+model,\n   last_ingestion}"]
+        D3["POST /admin/rebuild-image-descriptions\n→ starts background job\n  (perceptual hash dedup)"]
+        D4["GET /admin/rebuild-status\n→ {running, processed, updated,\n   total, skipped_already_done,\n   skipped_duplicate}"]
+    end
+    </div>
+  </div>
+
+  <!-- ── DIAGRAM 3: Qdrant Data Model ── -->
+  <div class="diagram-wrap">
+    <h2>3 · Qdrant Point — Payload Schema</h2>
+    <div class="mermaid">
+flowchart LR
+    subgraph TCHUNK["Text / Table Chunk"]
+        T1["page_content: str\n  extracted text ≤800 chars\n  OR table content"]
+        T2["metadata.source: 'Doc.pdf'\nmetadata.chunk_type: 'text'"]
+        T3["vector.dense: float32[1024]\nvector.sparse: BM25 weights"]
+    end
+    subgraph FCHUNK["Figure / Chart Chunk"]
+        F1["page_content: str\n  Gemma4 German description\n  incl. visible numbers,\n  chart type, conclusions"]
+        F2["metadata.source: 'Doc.pdf'\nmetadata.chunk_type: 'figure'\nmetadata.image_path: 'data/images/…'\nmetadata.image_description: str"]
+        F3["vector.dense: float32[1024]\nvector.sparse: BM25 weights"]
+    end
+    subgraph LCHUNK["Hyperlink Chunk  (DOCX only)"]
+        L1["page_content:\n  'Enthaltene Links in Doc.docx:\n   [Linktext](https://…)\n   …'"]
+        L2["metadata.source: 'Doc.docx'\nmetadata.chunk_type: 'text'"]
+    end
+    </div>
+  </div>
+
+  <!-- ── DIAGRAM 4: Retrieval Sequence ── -->
+  <div class="diagram-wrap">
+    <h2>4 · RAG Query — Sequence Detail</h2>
+    <div class="mermaid">
+sequenceDiagram
+    participant U as 👤 User
+    participant FE as Frontend (React)
+    participant BE as FastAPI
+    participant OL as Ollama · Gemma4
+    participant QD as Qdrant
+    participant DB as SQLite
+
+    U->>FE: Types question → Enter
+    FE->>BE: POST /chat {question, conversation_id, file_ids?}
+
+    BE->>OL: _expand_chain — generate 2 alt. phrasings
+    OL-->>BE: ["alt query 1", "alt query 2"]
+
+    loop 3 queries (original + 2 alternatives)
+        BE->>QD: hybrid_search(k=6, BGE-M3 + BM25 + RRF)
+        QD-->>BE: ranked docs with scores
+    end
+
+    BE->>BE: deduplicate by page_content
+    BE->>BE: typed sort → text_docs[:6] + figure_docs[:2]
+    BE->>BE: format_docs() → [1]…[N] numbered context
+
+    BE->>DB: SQLChatMessageHistory.get_messages()
+    DB-->>BE: full conversation history
+
+    BE->>OL: stream(system_prompt + history + context + question)
+    loop streaming tokens
+        OL-->>BE: token chunk
+        BE-->>FE: SSE data: {"token": "…"}
+        FE-->>U: renders incrementally + blinking cursor
+    end
+
+    OL-->>BE: generation complete
+    BE-->>FE: SSE data: {"sources": […], "chunks": […]}
+    BE-->>FE: SSE data: {"suggestions": ["?","?","?"]}
+    BE-->>FE: SSE data: {"done": true}
+
+    BE->>DB: save AI message to message_store
+    BE->>DB: save sources/chunks to message_sources
+
+    FE-->>U: citation badges [N] rendered
+    FE-->>U: Knowledge Panel available
+    FE-->>U: suggestion chips shown
+
+    alt First message in conversation
+        FE->>BE: POST /conversations/{id}/title
+        BE->>OL: "Erstelle Titel (max 6 Wörter): {first_message}"
+        OL-->>BE: German title
+        BE->>DB: INSERT conversation_titles
+        BE-->>FE: {"title": "…"}
+        FE-->>U: Sidebar title updates
+    end
+    </div>
+  </div>
+
+  <!-- ── DIAGRAM 5: Ingestion Sequence ── -->
+  <div class="diagram-wrap">
+    <h2>5 · Document Ingestion — Sequence Detail</h2>
+    <div class="mermaid">
+sequenceDiagram
+    participant U as 👤 User
+    participant FE as Frontend
+    participant BE as FastAPI
+    participant DC as Docling
+    participant OL as Ollama · Gemma4 Vision
+    participant EM as BGE-M3 + BM25
+    participant QD as Qdrant
+    participant DB as draxie.db
+
+    U->>FE: Drops file / clicks paperclip
+    FE->>BE: POST /documents (multipart)
+    BE-->>FE: {"status": "processing", "filename": "…"}
+    BE->>BE: save to tmp file
+
+    Note over BE: Background task starts (_ingest_file)
+
+    BE->>BE: copy to data/uploads/
+    BE->>DC: DocumentConverter.convert(tmp_path)
+    DC-->>BE: DoclingDocument
+
+    BE->>DC: HybridChunker.chunk() + contextualize()
+    DC-->>BE: raw chunks
+
+    loop each chunk
+        alt chunk is text/table
+            BE->>BE: RecursiveCharacterTextSplitter
+        else chunk is figure/chart
+            BE->>BE: _extract_images() → PNG → data/images/
+            BE->>OL: _describe_image(image_path, surrounding_text)
+            OL-->>BE: German description (Zahlen, Inhalt, Art)
+        end
+    end
+
+    alt .docx file
+        BE->>BE: _extract_docx_links() → hyperlink chunk
+    end
+
+    BE->>EM: embed all chunks (dense + sparse)
+    EM-->>BE: vectors
+    BE->>QD: vectorstore.add_documents(chunks)
+    QD-->>BE: ok
+
+    BE->>DB: INSERT ingestion_log (filename, chunks, status)
+    FE->>BE: GET /documents/status (polling)
+    BE-->>FE: {"status": "ok", "chunks": N}
+    FE-->>U: Upload confirmed
+    </div>
+  </div>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'dark',
+      themeVariables: {
+        primaryColor: '#1e1e2e',
+        primaryTextColor: '#cdd6f4',
+        primaryBorderColor: '#3b82f6',
+        lineColor: '#6c7086',
+        secondaryColor: '#181825',
+        tertiaryColor: '#11111b',
+        background: '#09090b',
+        mainBkg: '#181825',
+        nodeBorder: '#3b82f6',
+        clusterBkg: '#11111b',
+        clusterBorder: '#45475a',
+        titleColor: '#89b4fa',
+        edgeLabelBackground: '#1e1e2e',
+        fontFamily: 'monospace',
+      },
+      flowchart: { curve: 'basis', padding: 20 },
+      sequence: { actorMargin: 80, messageMargin: 40 },
+    });
+  </script>
+</body>
+</html>

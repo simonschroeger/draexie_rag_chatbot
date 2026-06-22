@@ -22,6 +22,26 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
+/* ── Light theme token overrides ────────────────────────────────────────── */
+[data-theme="light"] {
+  --color-surface-container-low:     #fafafa;
+  --color-surface-container:         #f4f4f5;
+  --color-surface-container-high:    #e4e4e7;
+  --color-surface-container-highest: #d4d4d8;
+  --color-on-surface:         #09090b;
+  --color-on-surface-variant: #52525b;
+  --color-outline-variant:    rgba(0, 0, 0, 0.1);
+  --color-secondary-container:    #e4e4e7;
+  --color-on-secondary-container: #18181b;
+}
+
+[data-theme="light"] .custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(0,0,0,0.12);
+}
+[data-theme="light"] .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(0,0,0,0.22);
+}
+
 @layer base {
   body {
     @apply bg-surface-container-low text-on-surface font-sans antialiased;
@@ -85,9 +105,9 @@
 .draexie-prose { line-height: 1.65; font-size: 0.875rem; }
 .draexie-prose p { margin-bottom: 0.5rem; }
 .draexie-prose p:last-child { margin-bottom: 0; }
-.draexie-prose ul { list-style: none; padding: 0; margin: 0.25rem 0; }
-.draexie-prose ul li { display: flex; gap: 0.5rem; align-items: flex-start; margin-bottom: 0.25rem; }
-.draexie-prose ul li::before { content: "•"; color: var(--color-primary-container); font-size: 0.75rem; margin-top: 0.1rem; flex-shrink: 0; }
+.draexie-prose ul { list-style: disc; padding: 0 0 0 1.2rem; margin: 0.25rem 0; }
+.draexie-prose ul li { display: list-item; margin-bottom: 0.25rem; }
+.draexie-prose ul li::marker { color: var(--color-primary-container); font-size: 0.85rem; }
 .draexie-prose ol { padding-left: 1.25rem; margin: 0.25rem 0; }
 .draexie-prose ol li { margin-bottom: 0.25rem; }
 .draexie-prose strong { font-weight: 600; }
@@ -101,7 +121,7 @@
 .draexie-prose pre { background: var(--color-surface-container-highest); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 0.85rem 1rem; overflow-x: auto; margin: 0.5rem 0; }
 .draexie-prose pre code { background: none; padding: 0; font-size: 0.78rem; }
 .draexie-prose sup { font-size: 0.65rem; color: rgba(59,130,246,0.8); font-family: var(--font-mono); margin-left: 1px; }
-.draexie-prose table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.8rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; overflow: hidden; }
+.draexie-prose table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.8rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; overflow: hidden; table-layout: fixed; }
 .draexie-prose thead { background: var(--color-surface-container-highest); }
 .draexie-prose thead th { padding: 0.5rem 0.75rem; text-align: left; font-weight: 600; color: var(--color-on-surface); border-bottom: 1px solid rgba(255,255,255,0.12); white-space: nowrap; }
 .draexie-prose tbody tr { border-bottom: 1px solid rgba(255,255,255,0.05); transition: background 0.15s; }
@@ -112,6 +132,58 @@
 /* ── Streaming cursor ───────────────────────────────────────── */
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
 .cursor-blink { display: inline-block; width: 2px; height: 1em; background: #3b82f6; margin-left: 2px; vertical-align: text-bottom; animation: blink 1s step-end infinite; }
+
+/* ── Citation badges ────────────────────────────────────────── */
+.cite-badge {
+  display: inline;
+  vertical-align: super;
+  background: color-mix(in srgb, var(--color-primary-container) 18%, transparent);
+  color: var(--color-primary-container);
+  border: 1px solid color-mix(in srgb, var(--color-primary-container) 30%, transparent);
+  border-radius: 4px;
+  padding: 0px 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.6;
+  cursor: pointer;
+  margin: 0 2px;
+  transition: background 0.12s, border-color 0.12s;
+  user-select: none;
+}
+.cite-badge:hover {
+  background: color-mix(in srgb, var(--color-primary-container) 28%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary-container) 50%, transparent);
+}
+@keyframes chunk-flash { 0%,100%{background:transparent} 30%{background:color-mix(in srgb,var(--color-primary-container) 15%,transparent)} }
+.highlight-chunk { animation: chunk-flash 1.2s ease; }
+@keyframes msg-flash { 0%,100%{background:transparent} 25%{background:color-mix(in srgb,var(--color-primary-container) 10%,transparent)} }
+.highlight-msg { animation: msg-flash 1.6s ease; border-radius: 12px; }
+
+/* ── In-chat search ───────────────────────────────────────────────────────── */
+mark.search-highlight {
+  background: color-mix(in srgb, var(--color-primary-container) 30%, transparent);
+  color: inherit; border-radius: 2px; padding: 0 2px;
+}
+mark.search-highlight.active {
+  background: var(--color-primary-container);
+  color: #fff;
+}
+.message-dimmed { opacity: 0.35; transition: opacity 0.15s ease; }
+.message-matched { transition: opacity 0.15s ease; }
+.message-active-match { transition: opacity 0.15s ease; }
+.in-chat-search-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 14px;
+  background: var(--color-surface-container-high);
+  border-bottom: 1px solid var(--color-outline-variant);
+  font-family: var(--font-mono); font-size: 12px;
+  flex-shrink: 0;
+}
+.in-chat-search-bar input {
+  flex: 1; background: transparent; border: none; outline: none;
+  color: var(--color-on-surface); font-family: inherit; font-size: inherit;
+}
 
 /* ── Suggestion chips ───────────────────────────────────────── */
 .suggestion-chip {

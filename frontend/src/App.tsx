@@ -1,41 +1,299 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo, createContext, useContext } from 'react';
 import {
   Plus, Menu, X,
   Trash2, Upload, Copy, Check,
-  ChevronDown, FileText, BookOpen,
+  ChevronDown, ChevronUp, ChevronLeft, ChevronRight, FileText, BookOpen,
   Paperclip, ArrowUp, Square, RotateCcw, Settings,
-  ThumbsUp, ThumbsDown, MoreHorizontal, ExternalLink,
+  ThumbsUp, ThumbsDown, MoreHorizontal, ExternalLink, Languages,
+  Sun, Moon, Search, MessageSquare, PanelLeft,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { marked } from 'marked';
+import markedKatex from 'marked-katex-extension';
+import 'katex/dist/katex.min.css';
 import DOMPurify from 'dompurify';
 import { RagMessage, Conversation, HealthStatus, ServerEvent, Chunk } from './types';
 import Mascot from './components/Mascot';
 
+// ── i18n ──────────────────────────────────────────────────────────────────────
+
+type Lang = 'de' | 'en';
+
+const translations = {
+  de: {
+    newChat:           'Neues Gespräch',
+    searchChats:       'Gespräch suchen…',
+    noChats:           'Noch keine Gespräche',
+    today:             'Heute',
+    yesterday:         'Gestern',
+    last7days:         'Letzte 7 Tage',
+    older:             'Älter',
+    unnamed:           'Unbenanntes Gespräch',
+    systemReady:       'System bereit',
+    unavailable:       'Nicht verfügbar',
+    lastImported:      'Zuletzt importiert',
+    messages:          (n: number) => `${n} Nachrichten in diesem Gespräch`,
+    sources:           (n: number) => `Quellen (${n})`,
+    sourcesTab:        'Quellen',
+    summaryTab:        'Zusammenfassung',
+    wikiTab:           'Wiki',
+    showLess:          'Weniger anzeigen',
+    showAll:           'Alles anzeigen',
+    uploading:         'Wird hochgeladen…',
+    processing:        'Wird verarbeitet…',
+    uploadError:       'Fehler beim Upload',
+    connError:         'Verbindungsfehler. Bitte versuche es erneut.',
+    connErrorShort:    'Verbindungsfehler.',
+    disclaimer:        'Dräxie kann Fehler machen. Bitte überprüfe wichtige Quellen.',
+    inputHints:        'Enter zum Senden · Shift+Enter für eine neue Zeile · ESC zum Stoppen',
+    placeholders: [
+      'Stelle eine Frage zu deinen Dokumenten…',
+      'Was sind die Einarbeitungsthemen für neue Mitarbeiter?',
+      'Erkläre den Änderungsmanagement-Prozess…',
+      'Was bedeutet die Abkürzung COP?',
+    ],
+    copyBtn:           'Kopieren',
+    helpfulBtn:        'Hilfreich',
+    notHelpfulBtn:     'Nicht hilfreich',
+    regenerateBtn:     'Neu generieren',
+    sysPromptPlaceholder: 'Zusätzliche Anweisungen für DRÄXIE…',
+    sysPromptTitle:    'Systemkontext (Ctrl+Shift+P)',
+    askToSeeSource:    'Stell eine Frage,\num Quellen zu sehen',
+    wikiPlaceholder:   'Wiki-Seiten erscheinen hier,\nsobald sie zur Antwort beitragen',
+    commonalities:     'Gemeinsamkeiten',
+    analysing:         'Analysiere…',
+    welcomeTitle:      'Was möchtest du wissen?',
+    welcomeSubtitle:   'Stell Fragen zu internen Prozessen, Produkten und Unternehmensabläufen bei DRÄXLMAIER.',
+    knowledgePanel:    'Wissensbereich',
+    openInNewTab:      'In neuem Tab',
+    dropFileHere:      'Datei hier ablegen oder klicken',
+    uploadTitle:       'Dokument hochladen',
+    attachFile:        'Datei anhängen',
+    newMessage:        'Neue Nachricht',
+    rename:            'Umbenennen',
+    delete:            'Löschen',
+    closeSidebar:      'Sidebar schließen',
+    openSidebar:       'Sidebar öffnen',
+    closePanel:        'Panel schließen',
+    openPanel:         'Wissensbereich öffnen',
+    pastedText:        'Eingefügt',
+    stopGenerating:    'Generierung stoppen (ESC)',
+    wasHelpful:        'War das hilfreich?',
+    uploadingFile:     (name: string) => `Lädt hoch: ${name}…`,
+    processingFile:    (name: string) => `✓ ${name} wird verarbeitet…`,
+    uploadFailed:      (err: string)  => `Fehler: ${err}`,
+    questionPool: [
+      'Was sind die Schritte im Änderungsmanagement-Prozess?',
+      'Wie buche ich Stunden korrekt im SAP?',
+      'Welche Produktbestandteile gehören zum DRÄXLMAIER-Portfolio?',
+      'Wie läuft die Kostenkalkulation für ein Fahrzeugprojekt ab?',
+      'Was sind die wichtigsten Abkürzungen in der Automobilindustrie?',
+      'Wie organisiere ich eine Dienstreise korrekt?',
+      'Was muss ich bei Kundenterminen beachten?',
+      'Wie funktioniert die Logistik und Disposition bei DRÄXLMAIER?',
+      'Was ist das CMH-System und wie wird es eingesetzt?',
+      'Wie richte ich mein Diensthandy ein?',
+      'Welche Segmente hat DRÄXLMAIER und was machen sie?',
+      'Was sind die Preisbestandteile in der Angebotskalkulation?',
+      'Wie läuft ein neues Fahrzeugprojekt von der Akquise bis zur Serienlieferung ab?',
+      'Was sind die typischen Regeltermine im Projektverlauf?',
+    ],
+  },
+  en: {
+    newChat:           'New Chat',
+    searchChats:       'Search chats…',
+    noChats:           'No conversations yet',
+    today:             'Today',
+    yesterday:         'Yesterday',
+    last7days:         'Last 7 days',
+    older:             'Older',
+    unnamed:           'Unnamed conversation',
+    systemReady:       'System ready',
+    unavailable:       'Unavailable',
+    lastImported:      'Last imported',
+    messages:          (n: number) => `${n} messages in this chat`,
+    sources:           (n: number) => `Sources (${n})`,
+    sourcesTab:        'Sources',
+    summaryTab:        'Summary',
+    wikiTab:           'Wiki',
+    showLess:          'Show less',
+    showAll:           'Show all',
+    uploading:         'Uploading…',
+    processing:        'Processing…',
+    uploadError:       'Upload error',
+    connError:         'Connection error. Please try again.',
+    connErrorShort:    'Connection error.',
+    disclaimer:        'Dräxie can make mistakes. Please verify important sources.',
+    inputHints:        'Enter to send · Shift+Enter for new line · ESC to stop',
+    placeholders: [
+      'Ask a question about your documents…',
+      'What are the onboarding topics for new employees?',
+      'Explain the change management process…',
+      'What does the abbreviation COP mean?',
+    ],
+    copyBtn:           'Copy',
+    helpfulBtn:        'Helpful',
+    notHelpfulBtn:     'Not helpful',
+    regenerateBtn:     'Regenerate',
+    sysPromptPlaceholder: 'Additional instructions for DRÄXIE…',
+    sysPromptTitle:    'System context (Ctrl+Shift+P)',
+    askToSeeSource:    'Ask a question\nto see sources',
+    wikiPlaceholder:   'Wiki pages appear here\nonce they contribute to the answer',
+    commonalities:     'Commonalities',
+    analysing:         'Analysing…',
+    welcomeTitle:      'What would you like to know?',
+    welcomeSubtitle:   'Ask questions about internal processes, products, and company operations at DRÄXLMAIER.',
+    knowledgePanel:    'Knowledge Panel',
+    openInNewTab:      'Open in new tab',
+    dropFileHere:      'Drop file here or click',
+    uploadTitle:       'Upload document',
+    attachFile:        'Attach file',
+    newMessage:        'New message',
+    rename:            'Rename',
+    delete:            'Delete',
+    closeSidebar:      'Close sidebar',
+    openSidebar:       'Open sidebar',
+    closePanel:        'Close panel',
+    openPanel:         'Open knowledge panel',
+    pastedText:        'Pasted',
+    stopGenerating:    'Stop generating (ESC)',
+    wasHelpful:        'Was this helpful?',
+    uploadingFile:     (name: string) => `Uploading: ${name}…`,
+    processingFile:    (name: string) => `✓ ${name} processing…`,
+    uploadFailed:      (err: string)  => `Error: ${err}`,
+    questionPool: [
+      'What are the steps in the change management process?',
+      'How do I correctly book hours in SAP?',
+      'Which product components are part of the DRÄXLMAIER portfolio?',
+      'How does cost calculation work for a vehicle project?',
+      'What are the key abbreviations used in the automotive industry?',
+      'How do I correctly organize a business trip?',
+      'What should I keep in mind for customer appointments?',
+      'How does logistics and dispatching work at DRÄXLMAIER?',
+      'What is the CMH system and how is it used?',
+      'How do I set up my company mobile phone?',
+      'What segments does DRÄXLMAIER have and what do they do?',
+      'What are the pricing components in a quotation calculation?',
+      'How does a new vehicle project progress from acquisition to series delivery?',
+      'What are the typical regular meetings in the project timeline?',
+    ],
+  },
+} as const;
+
+type T = typeof translations[Lang];
+const LangContext = createContext<{ lang: Lang; t: T; setLang: (l: Lang) => void }>({
+  lang: 'de', t: translations.de, setLang: () => {},
+});
+const useLang = () => useContext(LangContext);
+
 // ── Rotating placeholder ───────────────────────────────────────────────────
 
-const PLACEHOLDERS = [
-  'Ask about Q3 turnover data…',
-  'Which customers are at risk this quarter?',
-  'Summarize the HR policy on retention…',
-  'What are the top products by margin?',
-];
-
-function usePlaceholder() {
+function usePlaceholder(t: T) {
   const [idx, setIdx] = useState(0);
   const [visible, setVisible] = useState(true);
   useEffect(() => {
+    setIdx(0); // reset index on language change
+  }, [t]);
+  useEffect(() => {
     const id = setInterval(() => {
       setVisible(false);
-      setTimeout(() => { setIdx(i => (i + 1) % PLACEHOLDERS.length); setVisible(true); }, 400);
+      setTimeout(() => { setIdx(i => (i + 1) % t.placeholders.length); setVisible(true); }, 400);
     }, 4000);
     return () => clearInterval(id);
-  }, []);
-  return { text: PLACEHOLDERS[idx], visible };
+  }, [t]);
+  return { text: t.placeholders[idx], visible };
+}
+
+// ── Search helpers ─────────────────────────────────────────────────────────
+
+function normalizeForSearch(text: string): string {
+  return text.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+function highlightInHtml(html: string, query: string, markClass = 'search-highlight'): string {
+  if (!query || query.length < 2) return html;
+  const normQ = normalizeForSearch(query);
+  return html.replace(/(<[^>]+>)|([^<]+)/g, (_, tag, text) => {
+    if (tag) return tag;
+    if (!text) return '';
+    const normT = normalizeForSearch(text);
+    let result = '';
+    let i = 0;
+    while (i < text.length) {
+      const idx = normT.indexOf(normQ, i);
+      if (idx === -1) { result += text.slice(i); break; }
+      result += text.slice(i, idx);
+      result += `<mark class="${markClass}">${text.slice(idx, idx + query.length)}</mark>`;
+      i = idx + query.length;
+    }
+    return result;
+  });
+}
+
+// ── InChatSearchBar component ──────────────────────────────────────────────
+
+function InChatSearchBar({ query, onQueryChange, matchIdx, matchCount, onNext, onPrev, onClose, inputRef }: {
+  query: string;
+  onQueryChange: (q: string) => void;
+  matchIdx: number;
+  matchCount: number;
+  onNext: () => void;
+  onPrev: () => void;
+  onClose: () => void;
+  inputRef: React.RefObject<HTMLInputElement | null>;
+}) {
+  return (
+    <div className="in-chat-search-bar">
+      <Search size={13} className="text-on-surface-variant/50 shrink-0" />
+      <input
+        ref={inputRef}
+        type="text"
+        value={query}
+        onChange={e => onQueryChange(e.target.value)}
+        placeholder="Suche in diesem Chat…"
+        onKeyDown={e => {
+          if (e.key === 'Escape') { onClose(); }
+          else if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); onPrev(); }
+          else if (e.key === 'Enter') { e.preventDefault(); onNext(); }
+          else if (e.key === 'ArrowUp') { e.preventDefault(); onPrev(); }
+          else if (e.key === 'ArrowDown') { e.preventDefault(); onNext(); }
+        }}
+      />
+      {query.length >= 2 && (
+        <span className="text-[11px] text-on-surface-variant/60 font-mono shrink-0 whitespace-nowrap">
+          {matchCount === 0 ? '0 Treffer' : `${matchIdx + 1} von ${matchCount}`}
+        </span>
+      )}
+      <button
+        onClick={onPrev}
+        disabled={matchCount === 0}
+        className="p-1 rounded-lg text-on-surface-variant/60 hover:text-on-surface-variant hover:bg-surface-container-highest disabled:opacity-30 transition-all"
+        title="Vorheriger Treffer (↑)"
+      >
+        <ChevronUp size={14} />
+      </button>
+      <button
+        onClick={onNext}
+        disabled={matchCount === 0}
+        className="p-1 rounded-lg text-on-surface-variant/60 hover:text-on-surface-variant hover:bg-surface-container-highest disabled:opacity-30 transition-all"
+        title="Nächster Treffer (↓)"
+      >
+        <ChevronDown size={14} />
+      </button>
+      <button
+        onClick={onClose}
+        className="p-1 rounded-lg text-on-surface-variant/60 hover:text-on-surface-variant hover:bg-surface-container-highest transition-all"
+        title="Schließen (ESC)"
+      >
+        <X size={14} />
+      </button>
+    </div>
+  );
 }
 
 // ── Markdown / table renderer ──────────────────────────────────────────────
 
+marked.use(markedKatex({ throwOnError: false }));
 marked.use({ gfm: true, breaks: true });
 
 type ContentSegment =
@@ -57,8 +315,23 @@ function parseContent(text: string): ContentSegment[] {
       if (prose) segments.push({ type: 'prose', text: prose });
     }
     try {
-      const data = JSON.parse(match[1].trim());
-      segments.push({ type: 'table', title: data.title, columns: data.columns ?? [], rows: data.rows ?? [] });
+      const raw = match[1].trim();
+      let data: { title?: string; columns?: string[]; rows?: string[][] } | null = null;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        // lenient fallback: replace single quotes and strip trailing commas
+        try {
+          data = JSON.parse(raw.replace(/'/g, '"').replace(/,(\s*[}\]])/g, '$1'));
+        } catch {
+          console.warn('[ui-table] JSON parse failed:', raw);
+        }
+      }
+      if (data) {
+        segments.push({ type: 'table', title: data.title, columns: data.columns ?? [], rows: data.rows ?? [] });
+      } else {
+        segments.push({ type: 'table-error', raw });
+      }
     } catch {
       segments.push({ type: 'table-error', raw: match[1] });
     }
@@ -108,7 +381,7 @@ function TableBlock({ title, columns, rows }: { title?: string; columns: string[
   );
 }
 
-function MarkdownContent({ text, streaming }: { text: string; streaming?: boolean }) {
+function MarkdownContent({ text, streaming, searchHighlight, isActiveMatch }: { text: string; streaming?: boolean; searchHighlight?: string; isActiveMatch?: boolean }) {
   const segments = parseContent(text);
 
   return (
@@ -119,21 +392,42 @@ function MarkdownContent({ text, streaming }: { text: string; streaming?: boolea
         }
         if (seg.type === 'table-error') {
           return (
-            <pre key={i} className="draexie-prose text-[11px] text-on-surface-variant/60 whitespace-pre-wrap break-all">
-              {seg.raw}
-            </pre>
+            <p key={i} className="text-[11px] text-on-surface-variant/50 italic">
+              [Tabelle konnte nicht geladen werden]
+            </p>
           );
         }
-        const html = DOMPurify.sanitize(marked.parse(seg.text) as string, {
+        const sanitized = DOMPurify.sanitize(marked.parse(seg.text) as string, {
           ALLOWED_TAGS: [
             'p','br','strong','em','b','i','u','s','del',
             'h1','h2','h3','h4','h5','h6',
             'ul','ol','li',
             'blockquote','pre','code',
             'sup','sub','mark','a','hr',
+            'table','thead','tbody','tr','th','td',
+            // KaTeX math rendering
+            'math','mrow','mi','mo','mn','msup','msub','mfrac','msqrt','mtext',
+            'mspace','mover','munder','munderover','mtable','mtr','mtd','annotation',
+            'semantics','span',
           ],
-          ALLOWED_ATTR: ['href', 'target', 'rel', 'class'],
+          ALLOWED_ATTR: ['href', 'target', 'rel', 'class', 'style', 'aria-hidden', 'focusable', 'xmlns'],
         });
+        // Inject clickable cite badges for [N] / [N, M] markers, skipping code/pre/table blocks
+        let html = sanitized.replace(
+          /(<code[^>]*>[\s\S]*?<\/code>|<pre[^>]*>[\s\S]*?<\/pre>|<table[^>]*>[\s\S]*?<\/table>)|\[(\d+(?:,\s*\d+)*)\]/g,
+          (m, skip, nums) => {
+            if (skip) return skip;
+            return nums.split(/,\s*/).map(n => `<span class="cite-badge" data-cite="${n}">[${n}]</span>`).join('');
+          }
+        );
+        // Remove orphaned period that appears between adjacent cite badges: [1]. [2] → [1][2]
+        html = html.replace(/(<\/span>)\s*\.\s*(<span class="cite-badge")/g, '$1$2');
+        // Remove lone period immediately after the last cite badge before a closing block tag
+        html = html.replace(/(<span class="cite-badge"[^>]*>\[\d+\]<\/span>)\s*\.\s*(<\/(?:li|p|td|th|div)>)/gi, '$1$2');
+        // Apply search highlight after cite-badge injection
+        if (searchHighlight && searchHighlight.length >= 2) {
+          html = highlightInHtml(html, searchHighlight, isActiveMatch ? 'search-highlight active' : 'search-highlight');
+        }
         const isLast = i === segments.length - 1;
         return (
           <div
@@ -217,6 +511,7 @@ function ChunkContent({ chunk, expanded, onImageClick }: {
 // ── Document viewer modal ──────────────────────────────────────────────────
 
 function DocViewer({ src, chunks, onClose }: { src: string; chunks: Chunk[]; onClose: () => void }) {
+  const { t } = useLang();
   const ext = src.split('.').pop()?.toLowerCase() ?? '';
   const isPdf  = ext === 'pdf';
   const isImg  = ['png', 'jpg', 'jpeg', 'webp'].includes(ext);
@@ -244,9 +539,9 @@ function DocViewer({ src, chunks, onClose }: { src: string; chunks: Chunk[]; onC
           <a
             href={uploadUrl} target="_blank" rel="noopener noreferrer"
             className="flex items-center gap-1 px-2 py-1 text-[10px] font-mono text-on-surface-variant hover:text-primary-container hover:bg-surface-container-highest rounded transition-all"
-            title="In neuem Tab öffnen"
+            title={t.openInNewTab}
           >
-            <ExternalLink size={12} /> In neuem Tab
+            <ExternalLink size={12} /> {t.openInNewTab}
           </a>
           <button onClick={onClose} className="p-1.5 text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest rounded-lg transition-all">
             <X size={15} />
@@ -285,21 +580,42 @@ function DocViewer({ src, chunks, onClose }: { src: string; chunks: Chunk[]; onC
 
 // ── Knowledge panel sources tab ────────────────────────────────────────────
 
-function KnowledgeSources({ sources, chunks }: { sources: string[]; chunks: Chunk[] }) {
+function KnowledgeSources({ sources, chunks, targetChunkNum }: {
+  sources: string[];
+  chunks: Chunk[];
+  targetChunkNum?: number | null;
+}) {
+  const { t } = useLang();
   const [openSrc, setOpenSrc]         = useState<string | null>(null);
   const [expandedChunks, setExpanded] = useState<Set<number>>(new Set());
   const [viewer, setViewer]           = useState<{ src: string; chunks: Chunk[] } | null>(null);
   const [lightbox, setLightbox]       = useState<string | null>(null);
+  const chunkRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   const toggleChunk = (num: number) =>
     setExpanded(prev => { const s = new Set(prev); s.has(num) ? s.delete(num) : s.add(num); return s; });
+
+  useEffect(() => {
+    if (!targetChunkNum) return;
+    const targetSrc = chunks.find(c => c.num === targetChunkNum)?.source;
+    if (!targetSrc) return;
+    setOpenSrc(targetSrc);
+    setTimeout(() => {
+      const el = chunkRefs.current.get(targetChunkNum);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        el.classList.add('highlight-chunk');
+        setTimeout(() => el.classList.remove('highlight-chunk'), 1300);
+      }
+    }, 80);
+  }, [targetChunkNum, chunks]);
 
   if (!sources.length) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-center py-16">
         <FileText size={28} className="text-on-surface-variant/20 mb-3" />
         <p className="text-[11px] text-on-surface-variant/40 font-mono italic leading-relaxed">
-          Stell eine Frage,<br />um Quellen zu sehen
+          {t.askToSeeSource.split('\n')[0]}<br />{t.askToSeeSource.split('\n')[1]}
         </p>
       </div>
     );
@@ -315,6 +631,7 @@ function KnowledgeSources({ sources, chunks }: { sources: string[]; chunks: Chun
             : related.some(c => detectType(c) === 'table') ? 'table'
             : related.some(c => detectType(c) === 'code')  ? 'code'
             : 'text';
+          const chunkNums = related.map(c => c.num).sort((a, b) => a - b);
 
           return (
             <div key={src} className="bg-surface-container-low border border-outline-variant rounded-xl overflow-hidden">
@@ -326,10 +643,13 @@ function KnowledgeSources({ sources, chunks }: { sources: string[]; chunks: Chun
               >
                 <FileText size={11} className={`shrink-0 ${TYPE_BADGE[dominantType].cls.split(' ')[1]}`} />
                 <span className="text-[11px] font-medium flex-1 min-w-0 truncate">{src}</span>
-                <span className={`text-[8px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded font-mono shrink-0 ${TYPE_BADGE[dominantType].cls}`}>
-                  {TYPE_BADGE[dominantType].label}
+                {/* Citation numbers from this source */}
+                <span className="flex gap-0.5 shrink-0">
+                  {chunkNums.slice(0, 3).map(n => (
+                    <span key={n} className="cite-badge">{n}</span>
+                  ))}
+                  {chunkNums.length > 3 && <span className="text-[9px] text-on-surface-variant/40 font-mono">…</span>}
                 </span>
-                <span className="text-[9px] text-on-surface-variant/40 font-mono shrink-0">{related.length}</span>
                 <ChevronDown size={11} className={`text-on-surface-variant/40 shrink-0 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
               </button>
 
@@ -341,7 +661,11 @@ function KnowledgeSources({ sources, chunks }: { sources: string[]; chunks: Chun
                     const isExpanded = expandedChunks.has(c.num);
                     const needsExpand = type !== 'image' && (c.text.length > 280 || c.text.split('\n').length > 4);
                     return (
-                      <div key={c.num} className="px-3 py-2.5 space-y-1.5">
+                      <div
+                        key={c.num}
+                        ref={el => { if (el) chunkRefs.current.set(c.num, el); else chunkRefs.current.delete(c.num); }}
+                        className="px-3 py-2.5 space-y-1.5"
+                      >
                         <div className="flex items-center gap-2">
                           <span className="text-[9px] font-mono text-primary-container/60">[{c.num}]</span>
                           <span className={`text-[8px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded font-mono ${TYPE_BADGE[type].cls}`}>
@@ -360,7 +684,7 @@ function KnowledgeSources({ sources, chunks }: { sources: string[]; chunks: Chun
                             onClick={() => toggleChunk(c.num)}
                             className="text-[10px] font-mono text-primary-container/60 hover:text-primary-container transition-colors"
                           >
-                            {isExpanded ? 'Weniger anzeigen' : 'Alles anzeigen'}
+                            {isExpanded ? t.showLess : t.showAll}
                           </button>
                         )}
                       </div>
@@ -409,6 +733,7 @@ function SuggestionChips({ suggestions, onSelect }: { suggestions: string[]; onS
 // ── Feedback ───────────────────────────────────────────────────────────────
 
 function FeedbackRow({ convId, question, answer }: { convId: string; question: string; answer: string }) {
+  const { t } = useLang();
   const [voted, setVoted] = useState<string | null>(null);
   const vote = async (rating: 'up' | 'down') => {
     if (voted) return;
@@ -421,7 +746,7 @@ function FeedbackRow({ convId, question, answer }: { convId: string; question: s
   };
   return (
     <div className="mt-3 flex items-center gap-3">
-      <span className="text-[10px] text-on-surface-variant font-mono uppercase tracking-wider">War das hilfreich?</span>
+      <span className="text-[10px] text-on-surface-variant font-mono uppercase tracking-wider">{t.wasHelpful}</span>
       {(['up', 'down'] as const).map(r => (
         <button
           key={r}
@@ -451,6 +776,7 @@ function fmtSize(bytes: number) {
 }
 
 function AttachmentCard({ att, onRemove }: { att: Attachment; onRemove: () => void }) {
+  const { t } = useLang();
   if (att.kind === 'paste') {
     return (
       <div className="relative flex-shrink-0 w-44 bg-surface-container-high border border-outline-variant rounded-xl p-3">
@@ -461,7 +787,7 @@ function AttachmentCard({ att, onRemove }: { att: Attachment; onRemove: () => vo
           <X size={11} />
         </button>
         <span className="inline-block text-[9px] font-bold uppercase tracking-wider bg-primary-container/15 text-primary-container px-1.5 py-0.5 rounded font-mono mb-1.5">
-          Eingefügt
+          {t.pastedText}
         </span>
         <p className="text-[11px] text-on-surface-variant leading-relaxed line-clamp-3">
           {att.text.slice(0, 120)}{att.text.length > 120 ? '…' : ''}
@@ -472,10 +798,10 @@ function AttachmentCard({ att, onRemove }: { att: Attachment; onRemove: () => vo
 
   const isImage = att.file.type.startsWith('image/');
   const statusLabel: Record<AttachmentStatus, string> = {
-    uploading:  'Wird hochgeladen…',
-    processing: 'Wird verarbeitet…',
-    ready:      '✓ Bereit',
-    error:      'Fehler beim Upload',
+    uploading:  t.uploading,
+    processing: t.processing,
+    ready:      '✓',
+    error:      t.uploadError,
   };
   const statusColor: Record<AttachmentStatus, string> = {
     uploading:  'text-on-surface-variant/50',
@@ -525,6 +851,7 @@ function MessageActions({
   isLast: boolean;
   onRegenerate: () => void;
 }) {
+  const { t } = useLang();
   const [copied, setCopied] = useState(false);
   const storageKey = `draxie-fb-${msgId}`;
   const [vote, setVote] = useState<'up' | 'down' | null>(
@@ -548,21 +875,21 @@ function MessageActions({
     <div className="flex items-center gap-0.5 mt-2 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity duration-150">
       <button
         onClick={copy}
-        title="Kopieren"
+        title={t.copyBtn}
         className={`p-1.5 rounded-lg transition-all ${copied ? 'text-emerald-400' : 'text-on-surface-variant/40 hover:text-on-surface-variant hover:bg-surface-container-highest'}`}
       >
         {copied ? <Check size={13} /> : <Copy size={13} />}
       </button>
       <button
         onClick={() => toggleVote('up')}
-        title="Hilfreich"
+        title={t.helpfulBtn}
         className={`p-1.5 rounded-lg transition-all ${vote === 'up' ? 'text-emerald-400' : 'text-on-surface-variant/40 hover:text-on-surface-variant hover:bg-surface-container-highest'}`}
       >
         <ThumbsUp size={13} fill={vote === 'up' ? 'currentColor' : 'none'} />
       </button>
       <button
         onClick={() => toggleVote('down')}
-        title="Nicht hilfreich"
+        title={t.notHelpfulBtn}
         className={`p-1.5 rounded-lg transition-all ${vote === 'down' ? 'text-red-400' : 'text-on-surface-variant/40 hover:text-on-surface-variant hover:bg-surface-container-highest'}`}
       >
         <ThumbsDown size={13} fill={vote === 'down' ? 'currentColor' : 'none'} />
@@ -570,7 +897,7 @@ function MessageActions({
       {isLast && (
         <button
           onClick={onRegenerate}
-          title="Neu generieren"
+          title={t.regenerateBtn}
           className="p-1.5 rounded-lg text-on-surface-variant/40 hover:text-on-surface-variant hover:bg-surface-container-highest transition-all"
         >
           <RotateCcw size={13} />
@@ -590,18 +917,18 @@ function loadConvMeta(): Record<string, ConvMeta> {
 
 const MS_DAY = 86_400_000;
 
-function groupConversations(convs: Conversation[], meta: Record<string, ConvMeta>) {
+function groupConversations(convs: Conversation[], meta: Record<string, ConvMeta>, t: T) {
   const now = Date.now();
   const buckets: [string, Conversation[]][] = [
-    ['Heute', []], ['Gestern', []], ['Letzte 7 Tage', []], ['Älter', []],
+    [t.today, []], [t.yesterday, []], [t.last7days, []], [t.older, []],
   ];
   for (const c of convs) {
     const ts = meta[c.id]?.createdAt ?? 0;
     const age = now - ts;
-    if (ts && age < MS_DAY)       buckets[0][1].push(c);
+    if (ts && age < MS_DAY)        buckets[0][1].push(c);
     else if (ts && age < 2*MS_DAY) buckets[1][1].push(c);
     else if (ts && age < 7*MS_DAY) buckets[2][1].push(c);
-    else                            buckets[3][1].push(c);
+    else                           buckets[3][1].push(c);
   }
   return buckets.filter(([, list]) => list.length > 0);
 }
@@ -609,32 +936,33 @@ function groupConversations(convs: Conversation[], meta: Record<string, ConvMeta
 // ── Upload modal ───────────────────────────────────────────────────────────
 
 function UploadModal({ onClose, onSuccess }: { onClose: () => void; onSuccess?: (filename: string) => void }) {
+  const { t } = useLang();
   const [status, setStatus] = useState('');
   const [isError, setIsError] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const upload = async (file: File) => {
-    setStatus(`Lädt hoch: ${file.name}…`);
+    setStatus(t.uploadingFile(file.name));
     setIsError(false);
     const form = new FormData();
     form.append('file', file);
     try {
       const res = await fetch('/documents', { method: 'POST', body: form });
       const data = await res.json();
-      if (data.error) { setStatus(`Fehler: ${data.error}`); setIsError(true); }
+      if (data.error) { setStatus(t.uploadFailed(data.error)); setIsError(true); }
       else {
-        setStatus(`✓ ${file.name} wird verarbeitet…`);
+        setStatus(t.processingFile(file.name));
         onSuccess?.(file.name);
         setTimeout(onClose, 2000);
       }
-    } catch { setStatus('Verbindungsfehler.'); setIsError(true); }
+    } catch { setStatus(t.connErrorShort); setIsError(true); }
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
       <div className="bg-surface-container-high border border-outline-variant rounded-2xl p-6 w-96 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="flex justify-between items-center mb-4">
-          <h2 className="text-sm font-bold uppercase tracking-wider">Dokument hochladen</h2>
+          <h2 className="text-sm font-bold uppercase tracking-wider">{t.uploadTitle}</h2>
           <button onClick={onClose}><X size={16} /></button>
         </div>
         <div
@@ -644,7 +972,7 @@ function UploadModal({ onClose, onSuccess }: { onClose: () => void; onSuccess?: 
           onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) upload(f); }}
         >
           <Upload size={24} className="mx-auto mb-2 text-on-surface-variant" />
-          <p className="text-sm text-on-surface-variant">Datei hier ablegen oder klicken</p>
+          <p className="text-sm text-on-surface-variant">{t.dropFileHere}</p>
           <p className="text-[10px] text-on-surface-variant/50 mt-1 font-mono">PDF · DOCX · PPTX · XLSX · TXT</p>
         </div>
         <input ref={inputRef} type="file" className="hidden" accept=".pdf,.docx,.pptx,.xlsx,.txt,.md"
@@ -655,20 +983,107 @@ function UploadModal({ onClose, onSuccess }: { onClose: () => void; onSuccess?: 
   );
 }
 
+// ── Meta-question router ──────────────────────────────────────────────────────
+// Intercepts identity/capability questions client-side — no RAG call needed.
+
+const _META_DE = [
+  /wer bist du/i,
+  /was (bist|machst|kannst) du/i,
+  /was ist drä?xie/i,
+  /stell dich vor/i,
+  /über dich/i,
+  /erkl.{0,5}r.*drä?xie/i,
+  /wie funktionierst du/i,
+];
+
+const _META_EN = [
+  /who are you/i,
+  /what (are|do|can) you/i,
+  /what is drä?xie/i,
+  /introduce yourself/i,
+  /about (you|yourself)/i,
+  /tell me about (you|yourself)/i,
+  /how do you work/i,
+];
+
+const META_RESPONSE_DE = `## Hallo, ich bin DRÄXIE!
+
+Ich bin der interne KI-Assistent von **DRÄXLMAIER**, entwickelt, um Sales-Mitarbeiterinnen und -Mitarbeiter bei der Einarbeitung und im Tagesgeschäft zu unterstützen.
+
+**Was ich mache**
+- Ich durchsuche eine interne Wissensdatenbank aus offiziellen Unternehmensunterlagen — Handbücher, Schulungsmaterial, Prozessdokumente und mehr
+- Ich beantworte Fragen zu Produkten, Prozessen, Abkürzungen und Projekten
+- Jede Antwort enthält Quellenverweise, damit du nachprüfen kannst, woher die Information stammt
+
+**Was ich nicht tue**
+- Ich greife nicht auf externe Quellen oder das Internet zu
+- Ich antworte ausschließlich auf Basis der lokal bereitgestellten Dokumente — keine Vermutungen, keine externen Daten
+
+Stell mir einfach eine konkrete Frage, und ich zeige dir, was ich weiß!`;
+
+const META_RESPONSE_EN = `## Hello, I'm DRÄXIE!
+
+I'm the internal AI assistant for **DRÄXLMAIER**, built to support sales staff during onboarding and in their day-to-day work.
+
+**What I do**
+- Search an internal knowledge base built from official company documents — manuals, training materials, process guides, and more
+- Answer questions about products, processes, abbreviations, and projects
+- Include source references in every answer so you can verify where information comes from
+
+**What I don't do**
+- I don't access external sources or the internet
+- I only answer based on the locally provided documents — no guesswork, no external data
+
+Just ask me a specific question and I'll show you what I know!`;
+
+function pickRandom<T>(arr: readonly T[], n: number): T[] {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, n);
+}
+
+function matchMetaQuestion(text: string): string | null {
+  if (_META_DE.some(p => p.test(text))) return META_RESPONSE_DE;
+  if (_META_EN.some(p => p.test(text))) return META_RESPONSE_EN;
+  return null;
+}
+
 // ── Main App ───────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [lang, setLangState] = useState<Lang>(() =>
+    (localStorage.getItem('draxie-lang') as Lang) ?? 'de'
+  );
+  const t = translations[lang];
+  const setLang = (l: Lang) => {
+    setLangState(l);
+    localStorage.setItem('draxie-lang', l);
+    setShownQuestions(pickRandom(translations[l].questionPool, 4));
+  };
+
   const [messages, setMessages] = useState<RagMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [convId, setConvId] = useState(() => crypto.randomUUID());
+  const [convId, setConvId] = useState<string>(() => crypto.randomUUID());
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [convSearch, setConvSearch] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [uploadOpen, setUploadOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<'sources' | 'entities' | 'summary'>('sources');
+  const [activeTab, setActiveTab] = useState<'sources'>('sources');
   const [panelMsgId, setPanelMsgId] = useState<string | null>(null);
+  const [panelTargetChunk, setPanelTargetChunk] = useState<number | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem('draexie-onboarding-shown'));
+  const [theme, setTheme] = useState<'dark'|'light'>(() =>
+    (localStorage.getItem('draexie-theme') as 'dark'|'light') ?? 'dark'
+  );
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('draexie-theme', theme);
+  }, [theme]);
 
   const [showSysPrompt, setShowSysPrompt] = useState(false);
   const [sysPrompt, setSysPrompt] = useState(() => localStorage.getItem('draxie-sysprompt') ?? '');
@@ -679,20 +1094,79 @@ export default function App() {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [showScrollPill, setShowScrollPill] = useState(false);
+  const [leftCollapsed,  setLeftCollapsed]  = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(false);
+  const [shownQuestions, setShownQuestions] = useState<string[]>(() => pickRandom(translations[lang].questionPool, 4));
+  const [scrollToMsgIdx, setScrollToMsgIdx] = useState<number | null>(null);
+
+  // ── In-chat search state ───────────────────────────────────────────────────
+  const [inChatSearchOpen, setInChatSearchOpen] = useState(false);
+  const [inChatSearchQuery, setInChatSearchQuery] = useState('');
+  const [inChatDebouncedQuery, setInChatDebouncedQuery] = useState('');
+  const [inChatMatchMsgIdx, setInChatMatchMsgIdx] = useState(0);
+  const inChatInputRef = useRef<HTMLInputElement>(null);
+  const msgIdxRefs = useRef<Map<number, HTMLElement>>(new Map());
 
   const chatEndRef     = useRef<HTMLDivElement>(null);
   const chatAreaRef    = useRef<HTMLDivElement>(null);
   const inputRef       = useRef<HTMLTextAreaElement>(null);
   const fileInputRef   = useRef<HTMLInputElement>(null);
+  const msgRefs        = useRef<Map<string, HTMLElement>>(new Map());
   const streamStart    = useRef(0);
   const tokenCount     = useRef(0);
   const streamingMsgId = useRef('');
   const abortRef       = useRef<AbortController | null>(null);
   const autoScrollRef  = useRef(true);
 
+  // ── In-chat search: debounce ───────────────────────────────────────────────
+  useEffect(() => {
+    const timer = setTimeout(() => setInChatDebouncedQuery(inChatSearchQuery), 150);
+    return () => clearTimeout(timer);
+  }, [inChatSearchQuery]);
+
   const setMascot = useCallback((state: string) => {
     window.mascot?.setState(state);
   }, []);
+
+  // ── In-chat search: computed matching indices ──────────────────────────────
+  const inChatMatchingMsgIds = useMemo(() => {
+    if (inChatDebouncedQuery.length < 2) return [];
+    const q = normalizeForSearch(inChatDebouncedQuery);
+    return messages
+      .map((m, i) => ({ i, m }))
+      .filter(({ m }) =>
+        normalizeForSearch(m.content).includes(q) ||
+        (m.sources ?? []).some(s => normalizeForSearch(s).includes(q))
+      )
+      .map(({ i }) => i);
+  }, [messages, inChatDebouncedQuery]);
+
+  const inChatMatchSet = useMemo(() => new Set(inChatMatchingMsgIds), [inChatMatchingMsgIds]);
+
+  // ── In-chat search: navigation ─────────────────────────────────────────────
+  const goToInChatMatch = useCallback((idx: number) => {
+    if (!inChatMatchingMsgIds.length) return;
+    const c = ((idx % inChatMatchingMsgIds.length) + inChatMatchingMsgIds.length) % inChatMatchingMsgIds.length;
+    setInChatMatchMsgIdx(c);
+    const el = msgIdxRefs.current.get(inChatMatchingMsgIds[c]);
+    if (el) { autoScrollRef.current = false; el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+  }, [inChatMatchingMsgIds]);
+
+  const closeInChatSearch = useCallback(() => {
+    setInChatSearchOpen(false);
+    setInChatSearchQuery('');
+    setInChatDebouncedQuery('');
+    setInChatMatchMsgIdx(0);
+  }, []);
+
+  // ── In-chat search: auto-navigate when debounced query changes ─────────────
+  useEffect(() => {
+    if (!inChatSearchOpen || inChatMatchingMsgIds.length === 0) return;
+    setInChatMatchMsgIdx(0);
+    const el = msgIdxRefs.current.get(inChatMatchingMsgIds[0]);
+    if (el) { autoScrollRef.current = false; el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inChatDebouncedQuery]); // only fire when debounced query changes
 
   // ── Health poll ────────────────────────────────────────────────────────────
   const pollHealth = useCallback(async () => {
@@ -708,11 +1182,43 @@ export default function App() {
     return () => clearInterval(id);
   }, [pollHealth]);
 
+  // ── Scroll-to-message (triggered after search result click) ───────────────
+  useEffect(() => {
+    if (scrollToMsgIdx === null || messages.length === 0) return;
+    const msgId = String(scrollToMsgIdx);
+    const el = msgRefs.current.get(msgId);
+    if (!el) return;
+    setScrollToMsgIdx(null);
+    setTimeout(() => {
+      autoScrollRef.current = false;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('highlight-msg');
+      setTimeout(() => el.classList.remove('highlight-msg'), 1600);
+    }, 150);
+  }, [messages, scrollToMsgIdx]);
+
   // ── Conversation list ──────────────────────────────────────────────────────
   const loadConvList = useCallback(async () => {
     try {
-      const data: Conversation[] = await (await fetch('/conversations')).json();
+      const res = await fetch('/conversations');
+      if (!res.ok) return;
+      const data: Conversation[] = await res.json();
+      if (!Array.isArray(data)) return;
       setConversations(data);
+      // Seed localStorage timestamps for any conversations we haven't seen before
+      setConvMeta(prev => {
+        const next = { ...prev };
+        let changed = false;
+        data.forEach((c, i) => {
+          if (!next[c.id]?.createdAt) {
+            // Approximate recency: most recent first, spaced 1 min apart
+            next[c.id] = { ...next[c.id], createdAt: Date.now() - i * 60_000 };
+            changed = true;
+          }
+        });
+        if (changed) localStorage.setItem('draxie-conv-meta', JSON.stringify(next));
+        return changed ? next : prev;
+      });
     } catch { /* ignore */ }
   }, []);
 
@@ -754,18 +1260,33 @@ export default function App() {
   const panelChunks  = panelMsg?.chunks  ?? [];
 
   // ── Load conversation ──────────────────────────────────────────────────────
-  const loadConversation = async (id: string) => {
+  const loadConversation = async (id: string, scrollToIndex?: number, searchQuery?: string) => {
     setConvId(id);
     setSidebarOpen(false);
     setPanelMsgId(null);
+    if (scrollToIndex !== undefined) {
+      setScrollToMsgIdx(scrollToIndex);
+      autoScrollRef.current = false; // prevent scroll-to-bottom fighting the jump
+    }
+    if (searchQuery !== undefined && searchQuery.length >= 2) {
+      setInChatSearchQuery(searchQuery);
+      setInChatDebouncedQuery(searchQuery); // skip debounce delay
+      setInChatSearchOpen(true);
+      setInChatMatchMsgIdx(0);
+    }
     try {
-      const data: { messages: { role: string; content: string }[] } =
+      const data: { messages: { role: string; content: string; sources?: string[]; chunks?: Chunk[] }[] } =
         await (await fetch(`/conversations/${id}`)).json();
-      setMessages(data.messages.map((m, i) => ({
+      const mapped: RagMessage[] = data.messages.map((m, i) => ({
         id: String(i),
         role: m.role as 'user' | 'assistant',
         content: m.content,
-      })));
+        sources: m.sources,
+        chunks: m.chunks,
+      }));
+      setMessages(mapped);
+      const lastWithSources = [...mapped].reverse().find(m => m.role === 'assistant' && m.sources?.length);
+      if (lastWithSources && scrollToIndex === undefined) { setPanelMsgId(lastWithSources.id); setActiveTab('sources'); }
     } catch { setMessages([]); }
   };
 
@@ -780,6 +1301,8 @@ export default function App() {
     setMessages([]);
     setPanelMsgId(null);
     setSidebarOpen(false);
+    loadConvList();
+    setShownQuestions(pickRandom(t.questionPool, 4));
     setTimeout(() => inputRef.current?.focus(), 100);
   };
 
@@ -795,7 +1318,14 @@ export default function App() {
   // ── Keyboard shortcuts ─────────────────────────────────────────────────────
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault();
+        setInChatSearchOpen(true);
+        setTimeout(() => inChatInputRef.current?.focus(), 50);
+        return;
+      }
       if (e.key === 'Escape') {
+        if (inChatSearchOpen) { closeInChatSearch(); return; }
         if (isStreaming) stopGeneration();
         else if (openMenuId) setOpenMenuId(null);
         else setShowSysPrompt(false);
@@ -812,7 +1342,22 @@ export default function App() {
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isStreaming, stopGeneration, openMenuId]);
+  }, [isStreaming, stopGeneration, openMenuId, inChatSearchOpen, closeInChatSearch]);
+
+  // ── Onboarding tooltip auto-dismiss ───────────────────────────────────────
+  const dismissOnboarding = useCallback(() => {
+    setShowOnboarding(false);
+    localStorage.setItem('draexie-onboarding-shown', '1');
+  }, []);
+  useEffect(() => {
+    if (!showOnboarding) return;
+    const timer = setTimeout(dismissOnboarding, 6000);
+    document.addEventListener('click', dismissOnboarding, { once: true });
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('click', dismissOnboarding);
+    };
+  }, [showOnboarding, dismissOnboarding]);
 
   // ── File attachment — creates preview card and uploads in background ──────
   const createFileAttachment = useCallback(async (file: File) => {
@@ -826,24 +1371,24 @@ export default function App() {
       const res = await fetch('/documents', { method: 'POST', body: form });
       const data = await res.json();
       if (data.error) {
-        setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'error' as const } : a));
+        setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'error' as const } : a) as Attachment[]);
         return;
       }
-      setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'processing' as const } : a));
+      setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'processing' as const } : a) as Attachment[]);
       // Poll until this file appears as 'ok' in /documents/status
       const poll = setInterval(async () => {
         try {
           const rows: { filename: string; status: string }[] = await (await fetch('/documents/status')).json();
           if (rows.some(r => r.filename === file.name && r.status === 'ok')) {
             clearInterval(poll);
-            setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'ready' as const } : a));
+            setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'ready' as const } : a) as Attachment[]);
             pollHealth();
           }
         } catch { clearInterval(poll); }
       }, 3000);
       setTimeout(() => clearInterval(poll), 120_000);
     } catch {
-      setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'error' as const } : a));
+      setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'error' as const } : a) as Attachment[]);
     }
   }, [pollHealth]);
 
@@ -874,6 +1419,24 @@ export default function App() {
     streamingMsgId.current = aiMsg.id;
 
     setMessages(prev => [...prev.filter(m => m.id !== '__welcome__'), userMsg, aiMsg]);
+
+    // Reload sidebar so new conversation appears immediately
+    const isFirstMsg = messages.filter(m => m.id !== '__welcome__').length === 0;
+    if (isFirstMsg) setTimeout(() => loadConvList(), 500);
+
+    // ── Meta-question short-circuit ──────────────────────────────────────────
+    const metaHit = matchMetaQuestion(rawQ);
+    if (metaHit) {
+      setMessages(prev => prev.map(m =>
+        m.id === aiMsg.id ? { ...m, isStreaming: false, content: metaHit } : m
+      ));
+      setPanelMsgId(aiMsg.id);
+      setIsStreaming(false);
+      setMascot('found');
+      setTimeout(() => setMascot('idle'), 3000);
+      setTimeout(() => inputRef.current?.focus(), 50);
+      return;
+    }
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -926,6 +1489,15 @@ export default function App() {
             setPanelMsgId(doneId);
             setActiveTab('sources');
             setTimeout(() => setMascot('idle'), 3000);
+            // Auto-generate title after the first AI response in a new conversation
+            const currentMessages = messages;
+            const isFirstResponse = currentMessages.filter(m => m.role === 'assistant').length <= 1;
+            if (isFirstResponse && !convMeta[convId]?.title) {
+              fetch(`/conversations/${convId}/title`, { method: 'POST' })
+                .then(r => r.json())
+                .then(({ title }) => { saveConvMeta(convId, { title }); loadConvList(); })
+                .catch(() => {});
+            }
           }
         }
         return remainder;
@@ -945,7 +1517,7 @@ export default function App() {
       } else {
         setMascot('error');
         setMessages(prev => prev.map(m =>
-          m.isStreaming ? { ...m, isStreaming: false, content: 'Verbindungsfehler. Bitte versuche es erneut.' } : m
+          m.isStreaming ? { ...m, isStreaming: false, content: t.connError } : m
         ));
         setTimeout(() => setMascot('idle'), 4000);
       }
@@ -955,6 +1527,24 @@ export default function App() {
     setIsStreaming(false);
     setTimeout(() => inputRef.current?.focus(), 50);
   };
+
+  // ── Cross-chat search results ──────────────────────────────────────────────
+  type SearchResult = { id: string; title: string; excerpt: string; match_start: number; match_len: number; msg_index?: number; created_at?: string };
+  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
+  const [searchPending, setSearchPending] = useState(false);
+
+  useEffect(() => {
+    if (!convSearch.trim()) { setSearchResults(null); return; }
+    setSearchPending(true);
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`/conversations/search?q=${encodeURIComponent(convSearch)}`);
+        setSearchResults(await res.json());
+      } catch { setSearchResults([]); }
+      finally { setSearchPending(false); }
+    }, 220);
+    return () => clearTimeout(t);
+  }, [convSearch]);
 
   const filteredConvs = conversations.filter(c =>
     c.title.toLowerCase().includes(convSearch.toLowerCase())
@@ -967,13 +1557,14 @@ export default function App() {
   // id of the last non-streaming assistant message
   const lastAiMsgId = [...messages].reverse().find(m => m.role === 'assistant' && !m.isStreaming)?.id ?? null;
 
-  const placeholder = usePlaceholder();
+  const placeholder = usePlaceholder(t);
   const charCount = input.length;
   const CHAR_LIMIT = 4000;
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div className="flex h-[100dvh] bg-surface-container-low text-on-surface overflow-hidden">
+    <LangContext.Provider value={{ lang, t, setLang }}>
+    <div className="relative flex h-[100dvh] bg-surface-container-low text-on-surface overflow-hidden">
 
       {/* ── Left sidebar overlay (mobile) ───────────────────────────────────── */}
       <AnimatePresence>
@@ -987,17 +1578,103 @@ export default function App() {
       </AnimatePresence>
 
       {/* ── Left sidebar ────────────────────────────────────────────────────── */}
-      <aside className={`fixed md:relative inset-y-0 left-0 z-50 w-64 bg-surface-container border-r border-outline-variant flex flex-col transition-transform duration-300 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
+      <motion.aside
+        initial={false}
+        animate={{ width: leftCollapsed ? 56 : 256 }}
+        transition={{ type: 'tween', duration: 0.25, ease: [0.4, 0, 0.2, 1] }}
+        className={`fixed md:relative inset-y-0 left-0 z-50 bg-surface-container border-r border-outline-variant flex flex-col transition-transform duration-300 overflow-hidden shrink-0 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}
+      >
+
+        {/* ── Collapsed icon rail ──────────────────────────────────────────────── */}
+        {leftCollapsed && (
+          <div className="hidden md:flex flex-col items-center gap-1 py-3 h-full w-14">
+            {/* Expand */}
+            <button
+              onClick={() => setLeftCollapsed(false)}
+              title={t.openSidebar}
+              className="p-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest transition-all"
+            >
+              <PanelLeft size={16} />
+            </button>
+
+            <div className="w-6 border-t border-outline-variant/40 my-1" />
+
+            {/* New chat */}
+            <button
+              onClick={newConversation}
+              title={t.newChat}
+              className="p-2 rounded-lg text-on-surface-variant hover:text-primary-container hover:bg-surface-container-highest transition-all"
+            >
+              <Plus size={16} />
+            </button>
+
+            {/* History — expands sidebar */}
+            <button
+              onClick={() => setLeftCollapsed(false)}
+              title={t.searchChats}
+              className="p-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest transition-all"
+            >
+              <MessageSquare size={16} />
+            </button>
+
+            {/* Upload */}
+            <button
+              onClick={() => setUploadOpen(true)}
+              title="Upload"
+              className="p-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest transition-all"
+            >
+              <Upload size={16} />
+            </button>
+
+            <div className="flex-1" />
+
+            {/* Lang */}
+            <button
+              onClick={() => setLang(lang === 'de' ? 'en' : 'de')}
+              title={lang === 'de' ? 'Switch to English' : 'Zu Deutsch wechseln'}
+              className="p-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest transition-all"
+            >
+              <Languages size={14} />
+            </button>
+
+            {/* Theme */}
+            <button
+              onClick={() => setTheme(th => th === 'dark' ? 'light' : 'dark')}
+              title={theme === 'dark' ? 'Helles Design' : 'Dunkles Design'}
+              className="p-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest transition-all"
+            >
+              {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+            </button>
+          </div>
+        )}
+
+        {/* ── Full expanded sidebar ────────────────────────────────────────────── */}
+        {!leftCollapsed && <>
 
         {/* Brand */}
         <div className="flex items-center justify-between p-4 border-b border-outline-variant shrink-0">
-          <div>
-            <h1 className="text-base font-bold tracking-tight">DRÄXIE</h1>
-            <p className="text-[9px] font-mono text-on-surface-variant uppercase tracking-[0.2em]">Hochschule Landshut</p>
+          <h1 className="text-base font-bold tracking-tight">DRÄXIE</h1>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setLang(lang === 'de' ? 'en' : 'de')}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider border border-outline-variant text-on-surface-variant hover:bg-surface-container-high transition-colors"
+              title={lang === 'de' ? 'Switch to English' : 'Zu Deutsch wechseln'}
+            >
+              <Languages size={11} />
+              {lang === 'de' ? 'EN' : 'DE'}
+            </button>
+            {/* Desktop collapse button */}
+            <button
+              onClick={() => setLeftCollapsed(true)}
+              className="hidden md:flex items-center justify-center p-1.5 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest transition-all"
+              title={t.closeSidebar}
+            >
+              <PanelLeft size={14} />
+            </button>
+            <button className="md:hidden text-on-surface-variant" onClick={() => setSidebarOpen(false)}>
+              <X size={18} />
+            </button>
           </div>
-          <button className="md:hidden text-on-surface-variant" onClick={() => setSidebarOpen(false)}>
-            <X size={18} />
-          </button>
         </div>
 
         {/* New chat */}
@@ -1006,7 +1683,7 @@ export default function App() {
             onClick={newConversation}
             className="flex items-center gap-2 w-full px-3 py-2 bg-primary-container text-white rounded-xl text-sm font-semibold hover:brightness-110 active:scale-95 transition-all"
           >
-            <Plus size={16} /> Neues Gespräch
+            <Plus size={16} /> {t.newChat}
           </button>
         </div>
 
@@ -1015,20 +1692,63 @@ export default function App() {
           <input
             value={convSearch}
             onChange={e => setConvSearch(e.target.value)}
-            placeholder="Gespräch suchen…"
+            placeholder={t.searchChats}
             className="w-full bg-surface-container-high border border-outline-variant rounded-lg px-3 py-1.5 text-xs text-on-surface placeholder:text-on-surface-variant/50 focus:outline-none focus:border-primary-container/50"
           />
         </div>
 
-        {/* Conversation list — grouped by date */}
+        {/* Conversation list — grouped by date, or search results */}
         <div
           className="flex-1 overflow-y-auto custom-scrollbar px-2 pb-2 min-h-0"
           onClick={() => setOpenMenuId(null)}
         >
-          {filteredConvs.length === 0 ? (
-            <p className="text-[11px] text-on-surface-variant/50 text-center mt-4 font-mono">Noch keine Gespräche</p>
+          {/* Search results view */}
+          {convSearch.trim() && (
+            searchPending ? (
+              <p className="text-[11px] text-on-surface-variant/50 text-center mt-4 font-mono">…</p>
+            ) : searchResults && searchResults.length === 0 ? (
+              <p className="text-[11px] text-on-surface-variant/50 text-center mt-4 font-mono">{t.noChats}</p>
+            ) : searchResults ? (
+              <div className="space-y-0.5 pt-1">
+                {searchResults.map(r => {
+                  const before = r.excerpt.slice(0, r.match_start);
+                  const match  = r.excerpt.slice(r.match_start, r.match_start + r.match_len);
+                  const after  = r.excerpt.slice(r.match_start + r.match_len);
+                  // prefer DB created_at, fall back to JS-tracked timestamp
+                  const rawDate = r.created_at ?? (convMeta[r.id]?.createdAt ? new Date(convMeta[r.id].createdAt).toISOString() : null);
+                  const dateStr = rawDate
+                    ? new Date(rawDate).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: '2-digit' })
+                    : null;
+                  return (
+                    <div
+                      key={r.id}
+                      className={`px-2 py-2 rounded-lg cursor-pointer transition-colors ${
+                        r.id === convId
+                          ? 'bg-primary-container/10 border border-primary-container/20 text-on-surface'
+                          : 'text-on-surface-variant hover:bg-surface-container-highest hover:text-on-surface'
+                      }`}
+                      onClick={() => { const q = convSearch; setConvSearch(''); loadConversation(r.id, r.msg_index, q); }}
+                    >
+                      <div className="flex items-baseline justify-between gap-1 min-w-0">
+                        <p className="text-[12px] font-medium truncate flex-1 min-w-0">{r.title}</p>
+                        {dateStr && <span className="text-[9px] font-mono text-on-surface-variant/40 shrink-0">{dateStr}</span>}
+                      </div>
+                      <p className="text-[10px] text-on-surface-variant/60 mt-0.5 line-clamp-2 leading-relaxed">
+                        {before}<mark className="bg-primary-container/25 text-on-surface rounded px-0.5">{match}</mark>{after}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null
+          )}
+
+          {/* Normal grouped list (hidden while search is active) */}
+          {!convSearch.trim() && (
+          filteredConvs.length === 0 ? (
+            <p className="text-[11px] text-on-surface-variant/50 text-center mt-4 font-mono">{t.noChats}</p>
           ) : (
-            groupConversations(filteredConvs, convMeta).map(([label, group]) => (
+            groupConversations(filteredConvs, convMeta, t).map(([label, group]) => (
               <div key={label}>
                 <p className="text-[9px] font-bold uppercase tracking-widest text-on-surface-variant/40 px-2 pt-3 pb-1 font-mono">{label}</p>
                 {group.map(c => {
@@ -1066,7 +1786,10 @@ export default function App() {
                           className="flex-1 min-w-0 bg-surface-container-highest border border-primary-container/40 rounded px-1.5 py-0.5 text-[12px] text-on-surface focus:outline-none"
                         />
                       ) : (
-                        <p className="text-[12px] font-medium truncate flex-1 min-w-0">{displayTitle}</p>
+                        <p
+                          className="text-[12px] font-medium truncate flex-1 min-w-0"
+                          onDoubleClick={e => { e.stopPropagation(); setRenamingId(c.id); setRenameValue(displayTitle); }}
+                        >{displayTitle}</p>
                       )}
 
                       {/* … menu button */}
@@ -1086,13 +1809,13 @@ export default function App() {
                               onClick={() => { setRenameValue(displayTitle); setRenamingId(c.id); setOpenMenuId(null); }}
                               className="w-full text-left px-3 py-2 text-[12px] text-on-surface-variant hover:text-on-surface hover:bg-surface-container transition-colors"
                             >
-                              Umbenennen
+                              {t.rename}
                             </button>
                             <button
                               onClick={() => { deleteConversation(c.id); setOpenMenuId(null); }}
                               className="w-full text-left px-3 py-2 text-[12px] text-red-400 hover:bg-surface-container transition-colors"
                             >
-                              Löschen
+                              {t.delete}
                             </button>
                           </div>
                         )}
@@ -1102,44 +1825,40 @@ export default function App() {
                 })}
               </div>
             ))
-          )}
+          ))}
         </div>
 
-        {/* ── System status (non-technical) ──────────────────────────────────── */}
-        <div className="px-4 py-3 border-t border-outline-variant space-y-3 shrink-0">
-
-          {/* Online / offline */}
-          <div className="flex items-center gap-2">
-            <div className={`w-2 h-2 rounded-full shrink-0 ${health?.status === 'ok' ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
-            <span className="text-[11px] text-on-surface-variant">
-              {health?.status === 'ok' ? 'System bereit' : 'Nicht verfügbar'}
-            </span>
-          </div>
-
-          {/* Last uploaded file */}
+        {/* ── Sidebar footer ───────────────────────────────────────────────────── */}
+        <div className="px-4 py-3 border-t border-outline-variant shrink-0">
           {health?.last_ingestion && (
-            <div className="space-y-0.5">
-              <p className="text-[9px] uppercase tracking-wider text-on-surface-variant/40 font-mono">Zuletzt importiert</p>
+            <div className="space-y-0.5 mb-2">
+              <p className="text-[9px] uppercase tracking-wider text-on-surface-variant/40 font-mono">{t.lastImported}</p>
               <p className="text-[11px] text-on-surface truncate">{health.last_ingestion.filename}</p>
             </div>
           )}
-
-          {/* Message count */}
           {messageCount > 0 && (
-            <p className="text-[11px] text-on-surface-variant">{messageCount} Nachrichten in diesem Gespräch</p>
+            <p className="text-[11px] text-on-surface-variant">{t.messages(messageCount)}</p>
           )}
+          {messageCount > 0 && (
+            <p className="text-[9px] font-mono text-on-surface-variant/40 mt-0.5">
+              Gesprächskontext: {messageCount} Nachrichten
+            </p>
+          )}
+          {/* Light/dark toggle */}
+          <div className="mt-3 flex justify-end">
+            <button
+              onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+              className="p-1.5 rounded-lg text-on-surface-variant/50 hover:text-on-surface-variant hover:bg-surface-container-highest transition-all"
+              title={theme === 'dark' ? 'Helles Design' : 'Dunkles Design'}
+            >
+              {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+            </button>
+          </div>
         </div>
 
-        {/* Upload */}
-        <div className="p-3 border-t border-outline-variant shrink-0">
-          <button
-            onClick={() => setUploadOpen(true)}
-            className="flex items-center gap-2 w-full px-3 py-2 text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest rounded-xl text-xs transition-colors"
-          >
-            <Upload size={14} /> Dokument hochladen
-          </button>
-        </div>
-      </aside>
+        </>}
+
+      </motion.aside>
 
       {/* ── Main content ────────────────────────────────────────────────────── */}
       <main
@@ -1160,7 +1879,7 @@ export default function App() {
               className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-surface-container-low/90 backdrop-blur-sm border-2 border-dashed border-primary-container/50 rounded-none pointer-events-none"
             >
               <Paperclip size={32} className="text-primary-container mb-3" />
-              <p className="text-sm font-semibold text-primary-container">Datei anhängen</p>
+              <p className="text-sm font-semibold text-primary-container">{t.attachFile}</p>
               <p className="text-[11px] text-on-surface-variant mt-1">PDF · DOCX · TXT · PNG · JPG</p>
             </motion.div>
           )}
@@ -1171,13 +1890,30 @@ export default function App() {
           <button className="md:hidden text-on-surface-variant" onClick={() => setSidebarOpen(true)}>
             <Menu size={16} />
           </button>
-          <div className="flex items-center gap-2">
-            <div className={`w-1.5 h-1.5 rounded-full ${health?.status === 'ok' ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
-            <span className="text-[10px] font-mono text-on-surface-variant uppercase tracking-wider">
-              {health?.status === 'ok' ? 'Online' : 'Offline'}
-            </span>
-          </div>
+          {messages.length > 0 && (
+            <button
+              onClick={() => { setInChatSearchOpen(v => !v); if (!inChatSearchOpen) setTimeout(() => inChatInputRef.current?.focus(), 50); }}
+              className={`ml-auto p-1.5 rounded-lg transition-all ${inChatSearchOpen ? 'text-primary-container bg-primary-container/10' : 'text-on-surface-variant/60 hover:text-on-surface-variant hover:bg-surface-container-highest'}`}
+              title="In Chat suchen (Ctrl+F)"
+            >
+              <Search size={14} />
+            </button>
+          )}
         </div>
+
+        {/* In-chat search bar */}
+        {inChatSearchOpen && (
+          <InChatSearchBar
+            query={inChatSearchQuery}
+            onQueryChange={setInChatSearchQuery}
+            matchIdx={inChatMatchMsgIdx}
+            matchCount={inChatMatchingMsgIds.length}
+            onNext={() => goToInChatMatch(inChatMatchMsgIdx + 1)}
+            onPrev={() => goToInChatMatch(inChatMatchMsgIdx - 1)}
+            onClose={closeInChatSearch}
+            inputRef={inChatInputRef}
+          />
+        )}
 
         {/* Chat area */}
         <div
@@ -1193,15 +1929,10 @@ export default function App() {
                 initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}
                 className="text-center pt-12"
               >
-                <h2 className="text-2xl font-bold mb-2">Was möchtest du wissen?</h2>
-                <p className="text-sm text-on-surface-variant mb-8">Frag DRÄXIE nach Studienordnungen, Prüfungsfristen oder Modulbeschreibungen.</p>
+                <h2 className="text-2xl font-bold mb-2">{t.welcomeTitle}</h2>
+                <p className="text-sm text-on-surface-variant mb-8">{t.welcomeSubtitle}</p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-xl mx-auto text-left">
-                  {[
-                    'Welche Lehrveranstaltungen gibt es im Studium Generale?',
-                    'Wie viele ECTS bekomme ich für das Studium Generale?',
-                    'Was sind die Voraussetzungen für das Modulstudium?',
-                    'Wann endet die Rückmeldefrist für das Wintersemester?',
-                  ].map(q => (
+                  {shownQuestions.map(q => (
                     <button
                       key={q}
                       onClick={() => sendMessage(q)}
@@ -1216,72 +1947,118 @@ export default function App() {
 
             {/* Messages */}
             <AnimatePresence mode="popLayout">
-              {messages.map(msg => (
+              {messages.map((msg, msgArrayIdx) => {
+                const isMatch = inChatMatchSet.has(msgArrayIdx);
+                const isDimmed = inChatDebouncedQuery.length >= 2 && !isMatch;
+                const isActiveMatch = isMatch && inChatMatchingMsgIds[inChatMatchMsgIdx] === msgArrayIdx;
+                return (
                 <motion.div
                   key={msg.id}
+                  ref={el => {
+                    if (el) {
+                      msgRefs.current.set(msg.id, el as HTMLElement);
+                      msgIdxRefs.current.set(msgArrayIdx, el as HTMLElement);
+                    } else {
+                      msgRefs.current.delete(msg.id);
+                      msgIdxRefs.current.delete(msgArrayIdx);
+                    }
+                  }}
                   initial={{ opacity: 0, y: 12 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}${isDimmed ? ' message-dimmed' : ''}${isActiveMatch ? ' message-active-match' : isMatch ? ' message-matched' : ''}`}
                 >
                   {msg.role === 'user' ? (
                     <div className="max-w-[78%] bg-primary-container text-white px-4 py-3 rounded-2xl rounded-tr-sm text-sm leading-relaxed shadow-lg">
                       {msg.content}
                     </div>
                   ) : (
-                    <div className="w-full space-y-1 group">
-                      {/* Header label */}
-                      <div className="mb-2">
-                        <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-on-surface-variant">DRÄXIE</span>
-                      </div>
+                    (() => {
+                      const isNoAnswer = msg.content.includes('Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden');
+                      return (
+                        <div className="w-full space-y-1 group">
+                          {/* Header label */}
+                          <div className="mb-2">
+                            <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-on-surface-variant">DRÄXIE</span>
+                          </div>
 
-                      {/* Content */}
-                      <MarkdownContent text={msg.content} streaming={msg.isStreaming} />
+                          {/* Content — amber border for no-answer; cite-badge clicks handled via delegation */}
+                          <div
+                            className={isNoAnswer ? 'border-l-2 border-amber-500/50 pl-3' : ''}
+                            onClick={e => {
+                              const el = (e.target as Element).closest('[data-cite]');
+                              if (el) {
+                                const n = Number(el.getAttribute('data-cite'));
+                                setPanelMsgId(msg.id);
+                                setActiveTab('sources');
+                                setPanelTargetChunk(n);
+                              }
+                            }}
+                          >
+                            <MarkdownContent text={msg.content} streaming={msg.isStreaming} searchHighlight={inChatDebouncedQuery.length >= 2 ? inChatDebouncedQuery : undefined} isActiveMatch={isActiveMatch} />
+                          </div>
 
-                      {/* Sources button → opens Knowledge Panel */}
-                      {!msg.isStreaming && msg.sources && msg.sources.length > 0 && (
-                        <button
-                          onClick={() => { setPanelMsgId(msg.id); setActiveTab('sources'); }}
-                          className={`mt-2 flex items-center gap-1.5 text-[10px] font-mono transition-colors px-2 py-1 rounded-lg border ${
-                            panelMsgId === msg.id
-                              ? 'text-primary-container border-primary-container/30 bg-primary-container/5'
-                              : 'text-on-surface-variant border-outline-variant hover:text-primary-container hover:border-primary-container/30'
-                          }`}
-                        >
-                          <FileText size={10} />
-                          <span>Quellen ({msg.sources.length})</span>
-                        </button>
-                      )}
+                          {/* No-answer upload hint */}
+                          {isNoAnswer && !msg.isStreaming && (
+                            <p className="text-[10px] text-on-surface-variant/50 mt-1 pl-0.5">
+                              Dokument noch nicht importiert?{' '}
+                              <button
+                                onClick={() => setUploadOpen(true)}
+                                className="text-amber-400/80 underline underline-offset-2 hover:text-amber-400 transition-colors"
+                              >
+                                Dokument hinzufügen ↗
+                              </button>
+                            </p>
+                          )}
 
-                      {/* Suggestions */}
-                      {!msg.isStreaming && msg.suggestions && msg.suggestions.length > 0 && (
-                        <SuggestionChips suggestions={msg.suggestions} onSelect={q => sendMessage(q)} />
-                      )}
+                          {/* Sources button → opens Knowledge Panel (hidden for no-answer) */}
+                          {!msg.isStreaming && !isNoAnswer && msg.sources && msg.sources.length > 0 && (
+                            <button
+                              onClick={() => { setPanelMsgId(msg.id); setActiveTab('sources'); }}
+                              className={`mt-2 flex items-center gap-1.5 text-[10px] font-mono transition-colors px-2 py-1 rounded-lg border ${
+                                panelMsgId === msg.id
+                                  ? 'text-primary-container border-primary-container/30 bg-primary-container/5'
+                                  : 'text-on-surface-variant border-outline-variant hover:text-primary-container hover:border-primary-container/30'
+                              }`}
+                            >
+                              <FileText size={10} />
+                              <span>{t.sources(msg.sources.length)}</span>
+                            </button>
+                          )}
 
-                      {/* Action bar: copy, thumbs, regenerate */}
-                      {!msg.isStreaming && msg.content && (
-                        <MessageActions
-                          msgId={msg.id}
-                          content={msg.content}
-                          isLast={msg.id === lastAiMsgId}
-                          onRegenerate={() => lastUserMsg && sendMessage(lastUserMsg.content)}
-                        />
-                      )}
-                    </div>
+                          {/* Suggestions */}
+                          {!msg.isStreaming && msg.suggestions && msg.suggestions.length > 0 && (
+                            <SuggestionChips suggestions={msg.suggestions} onSelect={q => sendMessage(q)} />
+                          )}
+
+                          {/* Action bar: copy, thumbs, regenerate */}
+                          {!msg.isStreaming && msg.content && (
+                            <MessageActions
+                              msgId={msg.id}
+                              content={msg.content}
+                              isLast={msg.id === lastAiMsgId}
+                              onRegenerate={() => lastUserMsg && sendMessage(lastUserMsg.content)}
+                            />
+                          )}
+                        </div>
+                      );
+                    })()
                   )}
                 </motion.div>
-              ))}
+                );
+              })}
             </AnimatePresence>
 
             <div ref={chatEndRef} />
           </div>
         </div>
 
+        {/* Mascot — bottom-right corner, above the input bar, never over text */}
+        <div className="absolute bottom-40 right-3 z-30 pointer-events-none">
+          <Mascot />
+        </div>
+
         {/* ── Input area ──────────────────────────────────────────────────────── */}
         <div className="absolute bottom-0 left-0 right-0 z-30 pointer-events-none">
-          <div className="flex justify-center pointer-events-none">
-            <Mascot />
-          </div>
-
           <div className="px-4 pb-4 pointer-events-auto">
             <div className="max-w-3xl mx-auto space-y-2">
 
@@ -1303,51 +2080,28 @@ export default function App() {
                 )}
               </AnimatePresence>
 
-              {/* System prompt panel */}
-              <AnimatePresence>
-                {showSysPrompt && (
-                  <motion.div
-                    initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}
-                    className="bg-surface-container/95 backdrop-blur-xl border border-outline-variant rounded-2xl p-3 shadow-2xl"
-                  >
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-on-surface-variant">Systemkontext</span>
-                      <button onClick={() => setShowSysPrompt(false)} className="text-on-surface-variant/50 hover:text-on-surface-variant transition-colors">
-                        <X size={13} />
-                      </button>
-                    </div>
-                    <textarea
-                      rows={4}
-                      value={sysPrompt}
-                      onChange={e => { setSysPrompt(e.target.value); localStorage.setItem('draxie-sysprompt', e.target.value); }}
-                      placeholder="Zusätzliche Anweisungen für DRÄXIE…"
-                      className="w-full bg-surface-container-high border border-outline-variant rounded-xl px-3 py-2 text-xs text-on-surface placeholder:text-on-surface-variant/40 focus:outline-none focus:border-primary-container/50 resize-none font-mono leading-relaxed"
-                    />
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
               {/* Input pill */}
-              <div className="group relative bg-surface-container/90 backdrop-blur-xl border border-outline-variant rounded-2xl shadow-2xl transition-all focus-within:ring-2 focus-within:ring-primary-container/30">
+              <div className="relative bg-surface-container/90 backdrop-blur-xl border border-outline-variant rounded-2xl shadow-2xl transition-all focus-within:ring-2 focus-within:ring-primary-container/30">
 
-                {/* Gear icon — hover to reveal */}
-                <button
-                  onClick={() => setShowSysPrompt(v => !v)}
-                  title="Systemkontext (Ctrl+Shift+P)"
-                  className={`absolute top-2 right-2 p-1.5 rounded-lg transition-all text-on-surface-variant/30 group-hover:opacity-100 hover:text-on-surface-variant hover:bg-surface-container-highest ${showSysPrompt ? 'opacity-100 text-primary-container' : 'opacity-0'}`}
-                >
-                  <Settings size={13} />
-                </button>
-
-                <div className="flex items-end gap-2 p-1.5 pr-10">
-                  {/* Paperclip */}
-                  <button
-                    onClick={() => fileInputRef.current?.click()}
-                    className="p-2 text-on-surface-variant hover:text-primary-container hover:bg-surface-container-highest rounded-xl transition-all shrink-0"
-                    title="Datei anhängen"
-                  >
-                    <Paperclip size={17} />
-                  </button>
+                <div className="flex items-end gap-2 p-1.5">
+                  {/* Paperclip + onboarding tooltip */}
+                  <div className="relative shrink-0">
+                    {showOnboarding && (
+                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2.5 w-56 bg-surface-container-highest border border-outline-variant rounded-xl px-3 py-2.5 shadow-xl z-50 pointer-events-none">
+                        <p className="text-[10px] text-on-surface leading-relaxed">
+                          Eigene Dokumente hinzufügen — klicke hier oder ziehe Dateien ins Chatfenster
+                        </p>
+                        <div className="absolute top-full left-1/2 -translate-x-1/2 w-0 h-0 border-x-4 border-x-transparent border-t-4 border-t-outline-variant" />
+                      </div>
+                    )}
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="p-2 text-on-surface-variant hover:text-primary-container hover:bg-surface-container-highest rounded-xl transition-all"
+                      title={t.attachFile}
+                    >
+                      <Paperclip size={17} />
+                    </button>
+                  </div>
                   <input
                     ref={fileInputRef}
                     type="file"
@@ -1401,7 +2155,7 @@ export default function App() {
                     <button
                       onClick={stopGeneration}
                       className="p-2.5 bg-surface-container-highest border border-outline-variant text-on-surface-variant rounded-xl hover:text-on-surface hover:border-on-surface-variant/40 active:scale-95 transition-all shrink-0"
-                      title="Generierung stoppen (ESC)"
+                      title={t.stopGenerating}
                     >
                       <Square size={14} fill="currentColor" />
                     </button>
@@ -1417,8 +2171,12 @@ export default function App() {
                 </div>
               </div>
 
+              <p className="text-[11px] text-center text-on-surface-variant/40 select-none">
+                {t.disclaimer}
+              </p>
+
               <p className="text-[10px] text-center text-on-surface-variant/40 font-mono">
-                Enter senden · Shift+Enter neue Zeile · ESC stoppen
+                {t.inputHints}
               </p>
             </div>
           </div>
@@ -1433,50 +2191,65 @@ export default function App() {
               className="absolute bottom-40 left-1/2 -translate-x-1/2 z-40 flex items-center gap-1.5 px-3 py-1.5 bg-surface-container-highest border border-outline-variant rounded-full text-[11px] font-mono text-on-surface-variant shadow-lg hover:text-on-surface hover:border-primary-container/40 transition-all pointer-events-auto"
             >
               <ChevronDown size={13} />
-              Neue Nachricht
+              {t.newMessage}
             </motion.button>
           )}
         </AnimatePresence>
+
       </main>
 
       {/* ── Right panel — Knowledge Panel ───────────────────────────────────── */}
-      <aside className="hidden xl:flex w-72 bg-surface-container border-l border-outline-variant flex-col overflow-hidden">
+      <motion.aside
+        initial={false}
+        animate={{ width: rightCollapsed ? 0 : 288 }}
+        transition={{ type: 'tween', duration: 0.28, ease: [0.4, 0, 0.2, 1] }}
+        className="hidden xl:flex bg-surface-container border-l border-outline-variant flex-col overflow-hidden"
+      >
 
         {/* Header */}
         <div className="p-4 border-b border-outline-variant flex items-center gap-2 shrink-0">
           <BookOpen size={14} className="text-primary-container" />
-          <h2 className="text-[11px] font-bold uppercase tracking-[0.15em] text-on-surface-variant">Wissensbereich</h2>
+          <h2 className="text-[11px] font-bold uppercase tracking-[0.15em] text-on-surface-variant flex-1">{t.knowledgePanel}</h2>
+          <button
+            onClick={() => setRightCollapsed(true)}
+            className="p-1.5 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest transition-all"
+            title={t.closePanel}
+          >
+            <ChevronRight size={14} />
+          </button>
         </div>
 
-        {/* Tabs */}
+        {/* Tabs — sources only */}
         <div className="flex border-b border-outline-variant shrink-0">
-          {(['sources', 'entities', 'summary'] as const).map(tab => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={`flex-1 py-2.5 text-[10px] font-bold uppercase tracking-wider transition-colors border-b-2 ${
-                activeTab === tab
-                  ? 'text-primary-container border-primary-container'
-                  : 'text-on-surface-variant border-transparent hover:text-on-surface'
-              }`}
-            >
-              {tab === 'sources' ? 'Quellen' : tab === 'entities' ? 'Entitäten' : 'Zusammenfassung'}
-            </button>
-          ))}
+          <button
+            className="flex-1 py-2.5 text-[10px] font-bold uppercase tracking-wider border-b-2 text-primary-container border-primary-container"
+          >
+            {t.sourcesTab}
+          </button>
         </div>
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto custom-scrollbar p-4">
-          {activeTab === 'sources' && (
-            <KnowledgeSources sources={panelSources} chunks={panelChunks} />
-          )}
-          {activeTab !== 'sources' && (
-            <div className="flex flex-col items-center justify-center h-full text-center py-16">
-              <p className="text-[11px] text-on-surface-variant/40 font-mono italic">Kommt bald</p>
-            </div>
-          )}
+          <KnowledgeSources sources={panelSources} chunks={panelChunks} targetChunkNum={panelTargetChunk} />
         </div>
-      </aside>
+      </motion.aside>
+
+      {/* ── Right panel re-open tab ──────────────────────────────────────── */}
+      <AnimatePresence>
+        {rightCollapsed && (
+          <motion.button
+            initial={{ opacity: 0, x: 10 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 10 }}
+            transition={{ duration: 0.18 }}
+            onClick={() => setRightCollapsed(false)}
+            className="absolute right-0 top-[14px] z-40 hidden xl:flex flex-col items-center justify-center w-5 py-3 bg-surface-container border border-r-0 border-outline-variant rounded-l-xl text-on-surface-variant hover:text-primary-container hover:bg-surface-container-high transition-colors shadow-lg"
+            title={t.openPanel}
+          >
+            <ChevronLeft size={12} />
+          </motion.button>
+        )}
+      </AnimatePresence>
 
       {/* Upload modal */}
       {uploadOpen && (
@@ -1486,5 +2259,6 @@ export default function App() {
         />
       )}
     </div>
+    </LangContext.Provider>
   );
 }

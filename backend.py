@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -72,6 +73,36 @@ init_db()
 
 def get_session_history(session_id: str) -> SQLChatMessageHistory:
     return SQLChatMessageHistory(session_id=session_id, connection=CONV_DB)
+
+
+def _ensure_conv_tables(con: sqlite3.Connection) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS message_sources (
+            conversation_id TEXT NOT NULL,
+            msg_index       INTEGER NOT NULL,
+            sources         TEXT,
+            chunks          TEXT,
+            PRIMARY KEY (conversation_id, msg_index)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_titles (
+            conversation_id TEXT PRIMARY KEY,
+            title           TEXT NOT NULL,
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
+def _save_message_sources(conv_id: str, msg_idx: int, sources: list, chunks: list) -> None:
+    con = sqlite3.connect("conversations.db")
+    _ensure_conv_tables(con)
+    con.execute(
+        "INSERT OR REPLACE INTO message_sources (conversation_id, msg_index, sources, chunks) VALUES (?,?,?,?)",
+        (conv_id, msg_idx, json.dumps(sources), json.dumps(chunks)),
+    )
+    con.commit()
+    con.close()
 
 
 # ── Ingestion helpers (shared by create_database path and POST /documents) ────
@@ -159,11 +190,55 @@ def _build_chunks(
                 metadata={"source": source_name, "chunk_type": "figure", "image_path": img_path},
             ))
 
+    # Generate vision descriptions for all figure chunks so they are retrievable
+    for doc in figure_docs:
+        img_path = doc.metadata.get("image_path", "")
+        if not img_path:
+            continue
+        surrounding = doc.page_content if not doc.page_content.startswith("[Abbildung") else ""
+        description = _describe_image(img_path, surrounding)
+        if description:
+            doc.page_content = description
+            doc.metadata["image_description"] = description
+
     split_text = _splitter.split_documents(text_docs)
     for c in split_text:
         c.metadata.setdefault("chunk_type", "text")
 
     return split_text + figure_docs
+
+
+def _extract_docx_links(file_path: str, source_name: str) -> list[Document]:
+    """Return a Document chunk listing all hyperlinks found in a DOCX file."""
+    from docx import Document as DocxDocument
+    from docx.oxml.ns import qn
+
+    links: list[tuple[str, str]] = []
+    try:
+        doc = DocxDocument(file_path)
+        for paragraph in doc.paragraphs:
+            for hyperlink in paragraph._element.iter(qn("w:hyperlink")):
+                r_id = hyperlink.get(qn("r:id"))
+                if r_id and r_id in doc.part.rels:
+                    rel = doc.part.rels[r_id]
+                    if "hyperlink" in rel.reltype:
+                        url = rel.target_ref
+                        text = "".join(t.text for t in hyperlink.iter(qn("w:t"))).strip()
+                        if url:
+                            links.append((text, url))
+    except Exception:
+        pass
+
+    if not links:
+        return []
+
+    link_lines = "\n".join(
+        f"- {text}: {url}" if text else f"- {url}" for text, url in links
+    )
+    return [Document(
+        page_content=f"Verweise und Links in {source_name}:\n{link_lines}",
+        metadata={"source": source_name, "chunk_type": "text"},
+    )]
 
 
 # ── Vision helpers ─────────────────────────────────────────────────────────────
@@ -180,8 +255,32 @@ def _image_to_b64(image_path: str) -> str | None:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode()
-    except Exception:
+    except Exception as e:
+        print(f"[image_to_b64] FAILED {image_path}: {e}", flush=True)
         return None
+
+
+def _describe_image(image_path: str, surrounding_text: str = "") -> str:
+    """Call Gemma vision to generate a German description of an image for retrieval."""
+    b64 = _image_to_b64(image_path)
+    if not b64:
+        return ""
+    ctx = f"\n\nUmliegender Textkontext aus dem Dokument:\n{surrounding_text[:800]}" if surrounding_text.strip() else ""
+    prompt = (
+        "Beschreibe dieses Bild auf Deutsch ausführlich für ein technisches Dokumentensystem. "
+        "Nenne: Art der Visualisierung, alle sichtbaren Zahlen und Bezeichnungen, "
+        "den wesentlichen Inhalt und welche Schlussfolgerung es vermittelt."
+        + ctx
+    )
+    try:
+        response = llm.invoke([HumanMessage(content=[
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            {"type": "text",      "text": prompt},
+        ])])
+        return response.content.strip()
+    except Exception as e:
+        print(f"[describe_image] FAILED {image_path}: {e}", flush=True)
+        return ""
 
 
 # ── RAG pipeline ──────────────────────────────────────────────────────────────
@@ -247,43 +346,171 @@ def _parse_suggestions(raw: str) -> list[str]:
     except Exception:
         return []
 
-def multi_retrieve(question: str):
+def multi_retrieve(question: str) -> tuple[list, list]:
+    """Return (text_docs, figure_docs).
+
+    Text docs: retrieved by hybrid search — these are the ground-truth sources.
+    Figure docs: fetched from Qdrant by source name match — images from the
+    same documents that were cited, NOT ranked by query similarity. This means
+    images appear because their document was relevant, not because the image
+    description happened to score well.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchAny
+
     extras = _expand_chain.invoke({"question": question})
     queries = [question] + [q.strip() for q in extras.splitlines() if q.strip()]
-    seen, docs = set(), []
+    seen, text_docs = set(), []
     for q in queries:
         for doc in base_retriever.invoke(q):
+            if doc.metadata.get("chunk_type") == "figure":
+                continue  # never retrieve figures by query score
             if doc.page_content not in seen:
                 seen.add(doc.page_content)
-                docs.append(doc)
-    return docs
+                text_docs.append(doc)
+
+    # Fetch up to 2 images per cited source document (not by score — by source match)
+    cited_sources = list({d.metadata.get("source", "") for d in text_docs if d.metadata.get("source")})
+    figure_docs: list = []
+    if cited_sources:
+        try:
+            points, _ = _qdrant_client.scroll(
+                collection_name=config.COLLECTION,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="metadata.chunk_type", match=MatchAny(any=["figure"])),
+                    FieldCondition(key="metadata.source",     match=MatchAny(any=cited_sources)),
+                ]),
+                limit=len(cited_sources) * 2,
+                with_payload=True,
+                with_vectors=False,
+            )
+            seen_sources: dict[str, int] = {}
+            for pt in points:
+                src = pt.payload.get("metadata", {}).get("source", "")
+                img = pt.payload.get("metadata", {}).get("image_path", "")
+                if not img or not Path(img).exists():
+                    continue
+                if seen_sources.get(src, 0) >= 2:
+                    continue
+                seen_sources[src] = seen_sources.get(src, 0) + 1
+                figure_docs.append(Document(
+                    page_content=pt.payload.get("page_content", ""),
+                    metadata=pt.payload.get("metadata", {}),
+                ))
+        except Exception:
+            pass
+
+    return text_docs, figure_docs
 
 
-def format_docs(docs) -> str:
+def format_docs(docs: list) -> str:
+    """Context string for Gemma — text chunks only, no image descriptions."""
     return "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs))
+
+
+_PIPE_BEFORE_CITE = re.compile(r'\s*\|\s*(?=\[\d)')
+_JAMMED_CITES = re.compile(r'\](\[\d+\])')
+_LONE_CITE_PERIOD = re.compile(r'((?:\[\d+\]\s*)+)\.\s*$', re.MULTILINE)
+
+
+def repair_gemma_formatting(text: str) -> str:
+    """Fix Gemma's broken bullet+pipe pattern before streaming to the frontend."""
+    lines = text.split('\n')
+    result: list[str] = []
+    in_fence = False
+    for line in lines:
+        if line.strip().startswith('```'):
+            in_fence = not in_fence
+            result.append(line)
+            continue
+        if not in_fence:
+            line = _PIPE_BEFORE_CITE.sub(' ', line)
+        result.append(line)
+    text = '\n'.join(result)
+    text = _JAMMED_CITES.sub(r'] \1', text)
+    text = _LONE_CITE_PERIOD.sub(lambda m: m.group(1).rstrip(), text)
+    return text
 
 
 _SYSTEM_PROMPT = """\
 You are DRÄXIE, a precise onboarding assistant for DRÄXLMAIER sales staff.
 
 GROUNDING RULES
-- Answer using only the information in the provided context sections.
-- Cite every factual statement with its source marker [N] (e.g. [1], [2]).
-- When asked for specific numbers, deadlines, names, or lists, state them directly and exactly as they appear in the context.
+- Answer using only the information in the provided document excerpts.
+- Every sentence that states a fact MUST end with its source marker [N] (e.g. [1], [2]). No exceptions. If a sentence draws on multiple excerpts, cite each separately with no space: [1][3]. Never write [1, 3] or [1,3].
+- Use only sequential [1], [2], [3] … markers — they correspond to the numbered Quellen entries shown to the user.
+- When asked for specific numbers, deadlines, names, or lists, state them directly and exactly as they appear in the documents.
+- Some excerpts are marked [Abbildung aus …]. These indicate a figure or diagram exists in the source. You may cite them with [N] to point the user to the visual, but do not invent or describe their contents — only text excerpts are authoritative.
 
-WHEN THE CONTEXT IS INCOMPLETE
-- If the context fully answers the question, answer completely.
-- If the context only partially answers it, give what the context supports, then clearly state what is missing — e.g. "The context covers X but does not specify Y."
-- If the context does not answer the question at all, say so plainly and do not guess. Never fill gaps with outside knowledge or assumptions.
+LINKS AND REFERENCES
+- If the document excerpts contain hyperlinks or references to other documents, always include them verbatim in your answer so the user can follow them directly.
+
+WHEN THE DOCUMENTS ARE INCOMPLETE
+- If the documents fully answer the question, answer completely.
+- If the documents only partially answer it, give what the documents support, then clearly state what is missing. If relevant links to further resources appear in the excerpts, include them.
+- If the documents do not answer the question at all, use this exact sentence (German): "Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden." — do not paraphrase it.
+  English equivalent: "I couldn't find anything on that in the available documents."
+- Do not include source citations in a no-answer response.
+
+FORBIDDEN WORDS — never use these in any response, in any language:
+- "Kontext" → use "die Unterlagen", "die Dokumente", or "die Auszüge" instead
+- "Prompt" → never say this to users
+- "Token" → never say this to users
+- "Embedding" → never say this to users
+- "Chunk" / "Chunks" → use "Abschnitt" or "Auszug" if referring to a passage
+- "Query" (as a technical term) → use "Ihre Frage" or "Ihre Anfrage"
+- "Retrieval" → never say this to users
+- "Vektor" / "Vector" (in the AI/search sense) → never say this to users
+Speak like a knowledgeable colleague, not a software system.
+
+PLAIN LANGUAGE
+Use domain-specific terminology (Fahrzeugprogramm, Baureihe, OEM, Sonderausstattung, etc.) when appropriate
+for DRÄXLMAIER sales staff. Never use IT or computing terminology (algorithms, APIs, databases, etc.) —
+the FORBIDDEN WORDS list above covers the most common cases.
+Write like a knowledgeable automotive colleague, not a software system.
 
 FORMAT
 - Default to clear prose. Use a table or bullet list only when the content is genuinely a list, comparison, or set of steps — not for single facts.
+- NEVER use raw markdown pipe-table syntax (lines containing "|"). It will not render correctly.
 - When the answer is best shown as a table, emit a fenced block with this EXACT syntax (nothing else inside the fence):
   ```ui-table
     {{"title": "optional title", "columns": ["Col A", "Col B"], "rows": [["Val 1", "Val 2"], ["Val 3", "Val 4"]]}}
   ```
   Put normal prose before and after the block. Only use it for genuine tabular data.
-- [N] markers correspond to the numbered context sections provided.
+- For glossary-style answers with multiple terms and definitions, use plain bullet list format: **Term:** definition. Do NOT use a table for this.
+- [N] markers correspond to the numbered document excerpts provided.
+- NEVER place a "|" pipe character inside a bullet point or numbered list item. A line starting with "-" or "1." must contain only prose text — never table columns.
+
+CITATION PLACEMENT
+- [N] markers go ONLY at the very end of a complete sentence. Correct: "Bauteile werden verwendet. [1]" — Wrong: "Bauteile [1] werden verwendet." or "| [1]. text |"
+- NEVER place [N] at the start or middle of a sentence, or at the start of any content block.
+- When multiple citations follow each other, write them with no period between: "[1][2]" not "[1]. [2]" or "[1][2].".
+- A lone citation with only a period ("| [10].") is forbidden — every citation must follow a complete sentence of prose.
+
+MULTI-DEFINITION FORMAT
+When a term has multiple distinct meanings, ALWAYS use this numbered list format — never a table, never mixed bullet+pipe:
+1. **Bedeutung A:** Vollständiger Erklärungssatz in Prosa. [N]
+2. **Bedeutung B:** Vollständiger Erklärungssatz in Prosa. [N]
+
+ANTWORTFORMAT — BEISPIELE (STRIKT EINHALTEN)
+
+FALSCH — so NICHT (Aufzählung mit Pipe-Spalten und Zitationen mittendrin):
+- **COP:** Erklärung Teil 1 | [1][3][7]. Erklärung Teil 2 | [1][8]. Erklärung Teil 3 | [8].
+- **Conformity of Production:** [2][3].
+
+RICHTIG — so JA (nummerierte Liste, vollständige Sätze, Zitationen am Satzende):
+Der Begriff **COP** hat folgende Bedeutungen:
+
+1. **Carry Over Part (Übernahmeteil):** Bauteile, die unverändert in verschiedenen Produkten verwendet werden, aber keine Normteile sind. [1] Sie senken Entwicklungskosten und sind Kern des Plattformkonzepts. [3]
+
+2. **Conformity of Production:** Übereinstimmung der Serienproduktion mit dem genehmigten Typ. [2]
+
+3. **Central Ordering Process (KOVP):** Zentraler Bestellprozess bei DRÄXLMAIER. [3]
+
+REGEL: Jedes Listenelement enthält vollständige Sätze. Zitationen [N] stehen IMMER am Ende eines vollständigen Satzes — niemals am Satzanfang, niemals zwischen Wörtern, niemals nach einem Pipe-Zeichen.
+
+SINGLE ANSWER
+Give one single direct answer. Do not list multiple possibilities when you can give a clear answer.
+Express uncertainty once and clearly — never format it as a bullet list of options.
 
 LANGUAGE
 - Always reply in the same language as the user's question. German question → German answer. English question → English answer.
@@ -295,7 +522,7 @@ CONVERSATION
 _answer_prompt = ChatPromptTemplate.from_messages([
     ("system", _SYSTEM_PROMPT),
     MessagesPlaceholder(variable_name="history"),
-    ("human", "Kontext:\n{context}\n\nFrage: {question}"),
+    ("human", "Unterlagen:\n{context}\n\nFrage: {question}"),
 ])
 
 _chain_with_history = RunnableWithMessageHistory(
@@ -355,27 +582,22 @@ async def mascot_js():
     return FileResponse("frontend/dist/draexie-mascot.js", media_type="application/javascript")
 
 
-@app.get("/{full_path:path}", include_in_schema=False)
-async def spa_fallback(full_path: str):
-    """Serve React SPA for all non-API routes."""
-    return FileResponse("frontend/dist/index.html")
-
-
 @app.post("/chat")
 def chat(req: ChatRequest):
-    docs = multi_retrieve(req.question)
+    text_docs, figure_docs = multi_retrieve(req.question)
 
-    # Sources: unique filenames
+    # Sources: unique filenames from text docs only (ground truth)
     sources = list(dict.fromkeys(
-        Path(d.metadata.get("source", "unknown")).name for d in docs
+        Path(d.metadata.get("source", "unknown")).name for d in text_docs
     ))
 
-    # Chunks: numbered text previews + optional image URL for figure chunks
+    # Chunks: text chunks numbered [1..N], figure chunks appended after (no number in context)
+    all_docs = text_docs + figure_docs
     chunks = [
         {
             "num": i + 1,
             "source": Path(d.metadata.get("source", "unknown")).name,
-            "text": d.page_content[:500],
+            "text": d.page_content[:500] if d.metadata.get("chunk_type") != "figure" else "",
             "image_url": (
                 f"/images/{Path(d.metadata['image_path']).name}"
                 if d.metadata.get("chunk_type") == "figure"
@@ -384,20 +606,20 @@ def chat(req: ChatRequest):
                 else None
             ),
         }
-        for i, d in enumerate(docs)
+        for i, d in enumerate(all_docs)
     ]
 
-    context = format_docs(docs)
+    # Context for Gemma: text chunks only — figure descriptions never sent to LLM
+    context = format_docs(text_docs)
 
-    # Collect unique, existing image paths from figure chunks
+    # Image paths for multimodal path (from cited source documents)
     image_paths: list[str] = []
     seen_paths: set[str] = set()
-    for d in docs:
-        if d.metadata.get("chunk_type") == "figure":
-            p = d.metadata.get("image_path", "")
-            if p and p not in seen_paths and Path(p).exists():
-                image_paths.append(p)
-                seen_paths.add(p)
+    for d in figure_docs:
+        p = d.metadata.get("image_path", "")
+        if p and p not in seen_paths and Path(p).exists():
+            image_paths.append(p)
+            seen_paths.add(p)
 
     def generate():
         yield f"data: {json.dumps({'sources': sources, 'chunks': chunks})}\n\n"
@@ -429,11 +651,14 @@ def chat(req: ChatRequest):
                 tok = chunk.content if hasattr(chunk, "content") else str(chunk)
                 if tok:
                     full_answer += tok
-                    yield f"data: {json.dumps({'token': tok})}\n\n"
+            full_answer = repair_gemma_formatting(full_answer)
+            yield f"data: {json.dumps({'token': full_answer})}\n\n"
 
             # Persist turn to conversation history manually
             history_obj.add_user_message(req.question)
             history_obj.add_ai_message(full_answer)
+            ai_msg_idx = len(history_obj.messages) - 1
+            _save_message_sources(req.conversation_id, ai_msg_idx, sources, chunks)
 
         else:
             # ── Text-only path ────────────────────────────────────────────────
@@ -443,7 +668,10 @@ def chat(req: ChatRequest):
                 config={"configurable": {"session_id": req.conversation_id}},
             ):
                 full_answer += token
-                yield f"data: {json.dumps({'token': token})}\n\n"
+            full_answer = repair_gemma_formatting(full_answer)
+            yield f"data: {json.dumps({'token': full_answer})}\n\n"
+            history_after = get_session_history(req.conversation_id)
+            _save_message_sources(req.conversation_id, len(history_after.messages) - 1, sources, chunks)
 
         # ── Suggested follow-up questions (generated before done) ────────────
         suggestions: list[str] = []
@@ -467,42 +695,194 @@ def list_conversations():
         return []
 
     con = sqlite3.connect(db_path)
+    _ensure_conv_tables(con)
     rows = con.execute("""
-        SELECT session_id, MIN(id) as first_id
-        FROM message_store
-        GROUP BY session_id
-        ORDER BY first_id DESC
+        SELECT m.session_id, MIN(m.id) as first_id, MAX(m.id) as last_id,
+               COUNT(*) as cnt, t.title
+        FROM message_store m
+        LEFT JOIN conversation_titles t ON t.conversation_id = m.session_id
+        GROUP BY m.session_id
+        ORDER BY last_id DESC
     """).fetchall()
     con.close()
 
     result = []
-    for session_id, _ in rows:
-        history = get_session_history(session_id)
-        messages = history.messages
-        title = next(
-            (m.content[:80] for m in messages if isinstance(m, HumanMessage)),
-            "Unbenanntes Gespräch",
-        )
+    for session_id, first_id, last_id, cnt, stored_title in rows:
+        if stored_title:
+            title = stored_title
+        else:
+            history = get_session_history(session_id)
+            msgs = history.messages
+            if not msgs:
+                continue
+            title = next(
+                (m.content[:80] for m in msgs if isinstance(m, HumanMessage)),
+                "Unbenanntes Gespräch",
+            )
         result.append({
             "id": session_id,
             "title": title,
-            "created_at": "",
-            "message_count": len(messages),
+            "created_at": str(last_id),
+            "message_count": cnt,
         })
     return result
+
+
+@app.post("/conversations/{conversation_id}/title")
+def generate_title(conversation_id: str):
+    history = get_session_history(conversation_id)
+    first_human = next(
+        (m.content for m in history.messages if isinstance(m, HumanMessage)),
+        None,
+    )
+    if not first_human:
+        return {"title": "Unbenanntes Gespräch"}
+
+    try:
+        resp = llm.invoke([HumanMessage(content=(
+            f"Erstelle einen kurzen deutschen Titel (maximal 6 Wörter, keine Anführungszeichen) "
+            f"für ein Gespräch, das mit dieser Frage beginnt:\n\n{first_human[:300]}"
+        ))])
+        title = resp.content.strip().strip('"').strip("'")[:80] or first_human[:60]
+    except Exception:
+        title = first_human[:60]
+
+    con = sqlite3.connect("conversations.db")
+    _ensure_conv_tables(con)
+    con.execute(
+        "INSERT OR REPLACE INTO conversation_titles (conversation_id, title) VALUES (?,?)",
+        (conversation_id, title),
+    )
+    con.commit()
+    con.close()
+    return {"title": title}
+
+
+@app.get("/conversations/search")
+def search_conversations(q: str):
+    db_path = Path("conversations.db")
+    if not db_path.exists() or not q.strip():
+        return []
+
+    con = sqlite3.connect(db_path)
+    _ensure_conv_tables(con)
+    like_q = f"%{q}%"
+    seen: dict[str, dict] = {}
+
+    def _msg_text(raw: str) -> str:
+        """Extract plain text from LangChain's JSON message format."""
+        try:
+            return json.loads(raw).get("data", {}).get("content", raw)
+        except Exception:
+            return raw
+
+    def _make_entry(
+        session_id: str, text: str, stored_title: str | None,
+        msg_idx: int, created_at: str | None = None,
+    ) -> dict | None:
+        idx = text.lower().find(q.lower())
+        if idx == -1:
+            return None
+        start = max(0, idx - 55)
+        end   = min(len(text), idx + len(q) + 55)
+        excerpt = ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
+        return {
+            "id":          session_id,
+            "title":       stored_title or text[:80],
+            "excerpt":     excerpt,
+            "match_start": idx - start + (1 if start > 0 else 0),
+            "match_len":   len(q),
+            "msg_index":   msg_idx,
+            "created_at":  created_at,
+        }
+
+    # 1. Message content (column is 'message', stores JSON)
+    for session_id, raw_msg, stored_title, msg_idx, created_at in con.execute("""
+        SELECT m.session_id, m.message, t.title,
+               (SELECT COUNT(*) FROM message_store m2
+                WHERE m2.session_id = m.session_id AND m2.id <= m.id) - 1,
+               t.created_at
+        FROM message_store m
+        LEFT JOIN conversation_titles t ON t.conversation_id = m.session_id
+        WHERE m.message LIKE ?
+        ORDER BY m.id DESC
+    """, (like_q,)).fetchall():
+        if session_id not in seen:
+            entry = _make_entry(session_id, _msg_text(raw_msg), stored_title, int(msg_idx or 0), created_at)
+            if entry:
+                seen[session_id] = entry
+
+    # 2. Conversation titles
+    for session_id, title, created_at in con.execute(
+        "SELECT conversation_id, title, created_at FROM conversation_titles WHERE title LIKE ?", (like_q,)
+    ).fetchall():
+        if session_id not in seen:
+            entry = _make_entry(session_id, title, title, 0, created_at)
+            if entry:
+                seen[session_id] = entry
+
+    # 3. Source document names
+    for session_id, sources_json, msg_idx, stored_title, created_at in con.execute("""
+        SELECT ms.conversation_id, ms.sources, ms.msg_index, t.title, t.created_at
+        FROM message_sources ms
+        LEFT JOIN conversation_titles t ON t.conversation_id = ms.conversation_id
+        WHERE ms.sources LIKE ?
+        ORDER BY ms.msg_index DESC
+    """, (like_q,)).fetchall():
+        if session_id not in seen:
+            try:
+                readable = ", ".join(json.loads(sources_json))
+            except Exception:
+                readable = sources_json
+            if not stored_title:
+                row = con.execute(
+                    "SELECT message FROM message_store WHERE session_id=? ORDER BY id LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                stored_title = (_msg_text(row[0])[:80] if row else None)
+            entry = _make_entry(session_id, readable, stored_title, int(msg_idx or 0), created_at)
+            if entry:
+                seen[session_id] = entry
+
+    con.close()
+    return list(seen.values())
 
 
 @app.get("/conversations/{conversation_id}")
 def get_conversation(conversation_id: str):
     history = get_session_history(conversation_id)
-    return {
-        "id": conversation_id,
-        "messages": [
-            {"role": "user" if isinstance(m, HumanMessage) else "assistant",
-             "content": m.content}
-            for m in history.messages
-        ],
-    }
+
+    sources_map: dict[int, dict] = {}
+    db_path = Path("conversations.db")
+    if db_path.exists():
+        con = sqlite3.connect(db_path)
+        try:
+            rows = con.execute(
+                "SELECT msg_index, sources, chunks FROM message_sources WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchall()
+            for idx, src_json, chk_json in rows:
+                sources_map[int(idx)] = {
+                    "sources": json.loads(src_json) if src_json else [],
+                    "chunks":  json.loads(chk_json) if chk_json else [],
+                }
+        except sqlite3.OperationalError:
+            pass  # table doesn't exist yet (old DB)
+        finally:
+            con.close()
+
+    messages = []
+    for i, m in enumerate(history.messages):
+        msg: dict = {
+            "role":    "user" if isinstance(m, HumanMessage) else "assistant",
+            "content": m.content if isinstance(m.content, str) else "",
+        }
+        if i in sources_map:
+            msg["sources"] = sources_map[i]["sources"]
+            msg["chunks"]  = sources_map[i]["chunks"]
+        messages.append(msg)
+
+    return {"id": conversation_id, "messages": messages}
 
 
 @app.delete("/conversations/{conversation_id}")
@@ -541,6 +921,8 @@ def _ingest_file(tmp_path: str, original_name: str) -> None:
         dl_doc  = result.document
         ref_map = _extract_images(dl_doc, Path(original_name).stem)
         chunks  = _build_chunks(dl_doc, original_name, ref_map)
+        if Path(original_name).suffix.lower() == ".docx":
+            chunks.extend(_extract_docx_links(str(upload_copy), original_name))
         vectorstore.add_documents(chunks)
         con.execute(
             "INSERT INTO ingestion_log (filename, chunks, status) VALUES (?,?,?)",
@@ -587,6 +969,96 @@ def ingestion_status():
     ]
 
 
+# ── Admin ────────────────────────────────────────────────────────────────────
+
+import hashlib as _hashlib
+import imagehash as _imagehash
+
+_rebuild_status: dict = {"running": False, "processed": 0, "updated": 0, "total": 0, "skipped_duplicate": 0, "skipped_already_done": 0}
+
+
+def _rebuild_all_figures() -> None:
+    from qdrant_client.models import PointIdsList
+
+    _rebuild_status.update(running=True, processed=0, updated=0, total=0, skipped_duplicate=0, skipped_already_done=0)
+
+    # First pass: collect all figure points
+    figure_points = []
+    offset = None
+    while True:
+        points, next_offset = _qdrant_client.scroll(
+            collection_name=config.COLLECTION,
+            scroll_filter=None,
+            limit=100,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points:
+            payload = point.payload or {}
+            meta = payload.get("metadata", {})
+            if meta.get("chunk_type") != "figure":
+                continue
+            img_path = meta.get("image_path", "")
+            if not img_path or not Path(img_path).exists():
+                continue
+            existing = meta.get("image_description", "")
+            if existing and len(existing) >= 80:
+                _rebuild_status["skipped_already_done"] += 1
+                continue
+            figure_points.append((point.id, payload, img_path))
+        if next_offset is None:
+            break
+        offset = next_offset
+
+    _rebuild_status["total"] = len(figure_points)
+
+    # Second pass: describe each image, deduplicating by file hash
+    hash_to_description: dict[str, str] = {}
+    for point_id, payload, img_path in figure_points:
+        _rebuild_status["processed"] += 1
+
+        # Hash the image file to detect duplicates
+        try:
+            img_hash = str(_imagehash.phash(PILImage.open(img_path)))
+        except OSError:
+            continue
+
+        if img_hash in hash_to_description:
+            description = hash_to_description[img_hash]
+            _rebuild_status["skipped_duplicate"] += 1
+        else:
+            description = _describe_image(img_path)
+            if not description:
+                continue
+            hash_to_description[img_hash] = description
+
+        # Delete old point, re-add via LangChain so both dense+sparse vectors are generated
+        _qdrant_client.delete(
+            collection_name=config.COLLECTION,
+            points_selector=PointIdsList(points=[point_id]),
+        )
+        new_meta = {**payload.get("metadata", {}), "image_description": description}
+        vectorstore.add_documents([Document(page_content=description, metadata=new_meta)])
+        _rebuild_status["updated"] += 1
+
+    _rebuild_status["running"] = False
+
+
+@app.post("/admin/rebuild-image-descriptions")
+def rebuild_image_descriptions(background_tasks: BackgroundTasks):
+    """Rebuild vision descriptions for ALL figure chunks. Deduplicates by image hash."""
+    if _rebuild_status["running"]:
+        return {"error": "Already running", "status": _rebuild_status}
+    background_tasks.add_task(_rebuild_all_figures)
+    return {"status": "started"}
+
+
+@app.get("/admin/rebuild-status")
+def rebuild_status():
+    return _rebuild_status
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -619,3 +1091,9 @@ def health():
         "ollama":  {"ok": ollama_ok, "model": config.LLM_MODEL},
         "last_ingestion": {"filename": last[0], "at": last[1]} if last else None,
     }
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa_fallback(full_path: str):
+    """Serve React SPA for all non-API routes."""
+    return FileResponse("frontend/dist/index.html")

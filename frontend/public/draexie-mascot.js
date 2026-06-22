@@ -43,6 +43,12 @@
   const type1    = $('#d-type-1');
   const type2    = $('#d-type-2');
   const type3    = $('#d-type-3');
+  const pen         = $('#d-pen');
+  const notepad     = $('#d-notepad');
+  const notepadLine1 = $('#d-notepad-line-1');
+  const notepadLine2 = $('#d-notepad-line-2');
+  const notepadLine3 = $('#d-notepad-line-3');
+  const notepadLine4 = $('#d-notepad-line-4');
 
   // Eye pos layers have NO SVG transform attr — GSAP owns their position entirely.
   gsap.set(eyeLPos, { x: -20, y: -39 });
@@ -92,11 +98,12 @@
     if (blinkTimer)     { clearTimeout(blinkTimer); blinkTimer = null; }
     if (easterEggTimer) { clearTimeout(easterEggTimer); easterEggTimer = null; }
     gsap.killTweensOf([
-      mascot, head, body, armL, armR, mag, tablet, document_,
+      mascot, head, body, armL, armR, mag, tablet, pen, notepad, document_,
       sparks, think, typing, orbit, cheeks, mouth, antenna, antennaG,
       aura, drawer, map, mapPin, scaleG, scaleBeam, glitch, visor,
       eyeLPos, eyeLBlink, eyeLExpr, eyeRPos, eyeRBlink, eyeRExpr,
-      type1, type2, type3, ...chunks,
+      type1, type2, type3, notepadLine1, notepadLine2, notepadLine3, notepadLine4,
+      ...chunks,
     ]);
   };
 
@@ -117,7 +124,11 @@
     gsap.set(antennaG,  { x: 0, y: 0, rotation: 0, transformOrigin: '0px -72px' });
     gsap.set(antenna,   { scale: 1, opacity: 1, transformOrigin: '50% 50%' });
 
-    gsap.set([mag, tablet, document_, sparks, think, typing, drawer, map, scaleG, glitch], { opacity: 0 });
+    gsap.set([mag, tablet, pen, notepad, document_, sparks, think, typing, drawer, map, scaleG, glitch], { opacity: 0 });
+    gsap.set([pen, notepad], { scale: 0 });
+    gsap.set(pen,     { rotation: 0, transformOrigin: '43px 60px' });
+    gsap.set(notepad, { y: 0, rotation: 0, transformOrigin: '50% 50%' });
+    gsap.set([notepadLine1, notepadLine2, notepadLine3, notepadLine4], { opacity: 0 });
     gsap.set(orbit,     { opacity: 0 });
     gsap.set(chunks,    { opacity: 0, scale: 1, rotation: 0 });
     chunks.forEach(c => c.setAttribute('transform', 'translate(0,0)'));
@@ -152,8 +163,8 @@
 
   // ----- Idle easter eggs -----
   const idleEggs = [
-    // Yawn — weight 5
-    { w: 5, play: () => gsap.timeline()
+    // Yawn — weight 12
+    { w: 12, play: () => gsap.timeline()
         .to(antenna, { scale: 0.75, duration: 0.4, ease: 'sine.inOut' })
         .call(() => setExpr('sleepy'), null, '<')
         .to([eyeLBlink, eyeRBlink], { scaleY: 0.25, duration: 0.5, ease: 'sine.inOut', transformOrigin: '50% 50%' }, '<')
@@ -163,8 +174,8 @@
         .call(() => setExpr('normal'))
         .to(antenna, { scale: 1, duration: 0.4, ease: 'sine.inOut' }, '<')
     },
-    // Stretch arms — weight 3
-    { w: 3, play: () => gsap.timeline()
+    // Stretch arms — weight 8
+    { w: 8, play: () => gsap.timeline()
         .to([armL, armR], { rotation: (i) => i === 0 ? -85 : 85, duration: 0.5, ease: 'back.out(1.4)' })
         .to(mascot, { scaleY: 1.05, duration: 0.5, ease: 'power2.out' }, '<')
         .to([armL, armR], { rotation: 0, duration: 0.6, ease: 'elastic.out(1, 0.5)' }, '+=0.5')
@@ -178,8 +189,8 @@
         .to(head, { rotation: 0, duration: 0.6, ease: 'power2.inOut' }, '+=0.4')
         .call(() => setExpr('normal'))
     },
-    // Wave — weight 2
-    { w: 2, play: () => {
+    // Wave — weight 1
+    { w: 1, play: () => {
         const tl = gsap.timeline();
         tl.to(armR, { rotation: -70, duration: 0.35, ease: 'back.out(2)' });
         for (let i = 0; i < 3; i++) {
@@ -215,8 +226,8 @@
         .to([armL, armR], { rotation: 0, duration: 0.35, ease: 'power2.inOut' }, '<')
         .call(() => setExpr('normal'))
     },
-    // Spin (rare) — weight 0.5
-    { w: 0.5, play: () => gsap.timeline()
+    // Spin (rare) — weight 0.3
+    { w: 0.3, play: () => gsap.timeline()
         .to(mascot, { scaleX: 0, duration: 0.25, ease: 'power2.in' })
         .set(mascot, { scaleX: -1 })
         .to(mascot, { scaleX: 0, duration: 0.25, ease: 'power2.out' })
@@ -228,8 +239,8 @@
         .to(mascot, { scaleY: 1.08, y: -8, duration: 0.2, ease: 'power2.out' })
         .to(mascot, { scaleY: 1, y: 0, duration: 0.35, ease: 'elastic.out(1, 0.5)' })
     },
-    // Heart eyes (legendary) — weight 0.2
-    { w: 0.2, play: () => gsap.timeline()
+    // Heart eyes (legendary) — weight 0.1
+    { w: 0.1, play: () => gsap.timeline()
         .call(() => setExpr('heart'))
         .to(antenna, { scale: 1.6, duration: 0.4, ease: 'back.out(2)' })
         .to(cheeks, { opacity: 1, duration: 0.3 }, '<')
@@ -251,7 +262,7 @@
         if (roll <= 0) { activeTimelines.push(egg.play()); break; }
       }
       scheduleIdleEgg();
-    }, 7000 + Math.random() * 5000);
+    }, 4000 + Math.random() * 3000);
   };
 
   const pick = (arr, forced) => (forced != null && arr[forced]) ? forced : Math.floor(Math.random() * arr.length);
@@ -370,6 +381,46 @@
         const pulse = gsap.timeline({ repeat: -1, yoyo: true });
         pulse.to(antenna, { scale: 1.45, duration: 0.7, ease: 'sine.inOut' });
         activeTimelines.push(pulse);
+        return tl;
+    }},
+    // 5 — frantic-search
+    { name: 'frantic-search', play: () => {
+        setExpr('wide');
+        const tl = gsap.timeline({ defaults: { ease: 'power2.inOut' } });
+        tl.to(aura, { opacity: 0.9, duration: 0.4 }, 0);
+
+        const armLLoop = gsap.timeline({ repeat: -1, yoyo: true });
+        armLLoop.fromTo(armL, { rotation: -50 }, { rotation: -20, duration: 0.4, ease: 'sine.inOut' });
+        activeTimelines.push(armLLoop);
+
+        const armRLoop = gsap.timeline({ repeat: -1, yoyo: true, delay: 0.3 });
+        armRLoop.fromTo(armR, { rotation: 50 }, { rotation: 20, duration: 0.4, ease: 'sine.inOut' });
+        activeTimelines.push(armRLoop);
+
+        const headSwitch = gsap.timeline({ repeat: -1, yoyo: true });
+        headSwitch.fromTo(head, { rotation: -12 }, { rotation: 12, duration: 0.55, ease: 'sine.inOut' });
+        activeTimelines.push(headSwitch);
+
+        const bounce = gsap.timeline({ repeat: -1, yoyo: true });
+        bounce.to(mascot, { y: -10, duration: 0.38, ease: 'power1.inOut' });
+        activeTimelines.push(bounce);
+
+        const antennaVib = gsap.timeline({ repeat: -1, yoyo: true });
+        antennaVib.fromTo(antennaG, { rotation: -8 }, { rotation: 8, duration: 0.15, ease: 'sine.inOut', transformOrigin: '0px -72px' });
+        activeTimelines.push(antennaVib);
+
+        const thinkFlicker = gsap.timeline({ repeat: -1 });
+        thinkFlicker.to(think, { opacity: 1, duration: 0.3, ease: 'power1.in' })
+                    .to({}, { duration: 0.8 })
+                    .to(think, { opacity: 0, duration: 0.2 })
+                    .to({}, { duration: 0.5 });
+        activeTimelines.push(thinkFlicker);
+
+        const auraPulse = gsap.timeline({ repeat: -1, yoyo: true });
+        auraPulse.to(aura, { scale: 1.08, duration: 0.5, ease: 'sine.inOut' });
+        activeTimelines.push(auraPulse);
+
+        activeTimeline = tl;
         return tl;
     }},
   ];
@@ -510,8 +561,8 @@
     }},
   ];
 
-  const playAnalyzing = (forced) => {
-    const idx = pick(analyzeV, forced);
+  const playAnalyzing = (_forced) => {
+    const idx = 0; // single variant — orbital-sort only
     currentVariant = idx;
     activeTimeline = analyzeV[idx].play();
     scheduleBlink(0.9, 1.8);
@@ -576,8 +627,9 @@
     return rerankV[idx].name;
   };
 
-  /* ============================================================ GENERATING (2 variants) */
+  /* ============================================================ GENERATING (5 variants) */
   const generateV = [
+    // 0 — typing-fast
     { name: 'typing-fast', play: () => {
         setExpr('determined');
         const tl = gsap.timeline({ defaults: { ease: 'power2.inOut' } });
@@ -587,7 +639,6 @@
         tl.to(typing, { opacity: 1, duration: 0.4 }, 0.3);
         tl.to(aura,   { opacity: 0.75, duration: 0.5 }, 0);
 
-        // Staggered arm typing
         const typeL = gsap.timeline({ repeat: -1 });
         typeL.to(armL, { y: 5,  duration: 0.11, ease: 'sine.inOut' })
              .to(armL, { y: 11, duration: 0.11, ease: 'sine.inOut' })
@@ -610,30 +661,124 @@
         activeTimeline = tl;
         return tl;
     }},
+    // 1 — deep-focus
     { name: 'deep-focus', play: () => {
         setExpr('focused');
         const tl = gsap.timeline({ defaults: { ease: 'sine.inOut' } });
-        // Contemplative: arms folded down, head slightly forward
         tl.to(armL,   { rotation: 15, y: 6, duration: 0.7, ease: 'power2.inOut' }, 0);
         tl.to(armR,   { rotation: -15, y: 6, duration: 0.7, ease: 'power2.inOut' }, 0);
         tl.to(head,   { y: 5, rotation: -3, duration: 0.6, ease: 'power2.inOut' }, 0);
         tl.to(typing, { opacity: 1, duration: 0.6 }, 0.4);
         tl.to(aura,   { opacity: 1.0, scale: 1.12, duration: 0.8 }, 0);
 
-        // Slow, deep breathing
         const breath = gsap.timeline({ repeat: -1, yoyo: true, repeatDelay: 0.4 });
         breath.to(mascot, { scaleY: 1.025, scaleX: 0.98, y: -3, duration: 1.6, ease: 'sine.inOut' });
         activeTimelines.push(breath);
 
-        // Antenna glows slowly
         const glow = gsap.timeline({ repeat: -1, yoyo: true });
         glow.to(antenna, { scale: 1.7, duration: 1.4, ease: 'sine.inOut' });
         activeTimelines.push(glow);
 
-        // Dots pulse slowly
         [type1, type2, type3].forEach((dot, i) => {
           const d = gsap.timeline({ repeat: -1, delay: i * 0.3 });
           d.to(dot, { opacity: 0.2, duration: 0.3 }).to(dot, { opacity: 1, duration: 0.3 }).to({}, { duration: 0.7 });
+          activeTimelines.push(d);
+        });
+
+        activeTimeline = tl;
+        return tl;
+    }},
+    // 2 — pen-writing
+    { name: 'pen-writing', play: () => {
+        setExpr('determined');
+        const tl = gsap.timeline({ defaults: { ease: 'power2.inOut' } });
+        tl.to(armR,    { rotation: -40, duration: 0.5, ease: 'back.out(1.6)' }, 0);
+        tl.to(armL,    { rotation:  10, duration: 0.5, ease: 'back.out(1.4)' }, 0);
+        tl.to(head,    { y: 4, rotation: -5, duration: 0.5 }, 0);
+        tl.to(pen,     { opacity: 1, scale: 1, duration: 0.45, ease: 'back.out(2)' }, 0.2);
+        tl.to(notepad, { opacity: 1, scale: 1, duration: 0.4,  ease: 'back.out(1.6)' }, 0.3);
+        tl.to(typing,  { opacity: 1, duration: 0.4 }, 0.5);
+        tl.to(aura,    { opacity: 0.8, duration: 0.5 }, 0);
+
+        const write = gsap.timeline({ repeat: -1, yoyo: true });
+        write.to(armR, { rotation: -52, duration: 0.22, ease: 'sine.inOut' });
+        activeTimelines.push(write);
+
+        const lineAnim = gsap.timeline({ repeat: -1 });
+        [notepadLine1, notepadLine2, notepadLine3, notepadLine4].forEach((line, i) => {
+          lineAnim.to(line, { opacity: 1, duration: 0.2 }, i * 0.8);
+        });
+        lineAnim.to([notepadLine1, notepadLine2, notepadLine3, notepadLine4], { opacity: 0, duration: 0.3 }, 3.2);
+        activeTimelines.push(lineAnim);
+
+        const nod = gsap.timeline({ repeat: -1, yoyo: true });
+        nod.to(head, { rotation: -7, duration: 0.8, ease: 'sine.inOut' });
+        activeTimelines.push(nod);
+
+        const pulse = gsap.timeline({ repeat: -1, yoyo: true });
+        pulse.to(antenna, { scale: 1.3, duration: 0.9, ease: 'sine.inOut' });
+        activeTimelines.push(pulse);
+
+        [type1, type2, type3].forEach((dot, i) => {
+          const d = gsap.timeline({ repeat: -1, delay: i * 0.18 });
+          d.to(dot, { opacity: 0.25, duration: 0.18 }).to(dot, { opacity: 1, duration: 0.18 }).to({}, { duration: 0.38 });
+          activeTimelines.push(d);
+        });
+
+        activeTimeline = tl;
+        return tl;
+    }},
+    // 3 — pen-thinking
+    { name: 'pen-thinking', play: () => {
+        setExpr('curious');
+        const tl = gsap.timeline({ defaults: { ease: 'power2.inOut' } });
+        tl.to(armR,    { rotation: -50, duration: 0.5, ease: 'back.out(1.5)' }, 0);
+        tl.to(armL,    { rotation:  35, duration: 0.5, ease: 'back.out(1.5)' }, 0);
+        tl.to(pen,     { opacity: 1, scale: 1, duration: 0.45, ease: 'back.out(2)' }, 0.2);
+        tl.to(notepad, { opacity: 1, scale: 1, duration: 0.4,  ease: 'back.out(1.6)' }, 0.25);
+        tl.to(think,   { opacity: 1, duration: 0.5 }, 0.3);
+
+        const tap = gsap.timeline({ repeat: -1, repeatDelay: 0.7 });
+        tap.to(armR, { rotation: -58, duration: 0.15, ease: 'power2.out' })
+           .to(armR, { rotation: -50, duration: 0.15, ease: 'power2.in' });
+        activeTimelines.push(tap);
+
+        const tilt = gsap.timeline({ repeat: -1, yoyo: true, repeatDelay: 0.3 });
+        tilt.to(head, { rotation: 6, duration: 1.8, ease: 'sine.inOut' });
+        activeTimelines.push(tilt);
+
+        const pulse = gsap.timeline({ repeat: -1, yoyo: true });
+        pulse.to(antenna, { scale: 1.4, duration: 1.1, ease: 'sine.inOut' });
+        activeTimelines.push(pulse);
+
+        activeTimeline = tl;
+        return tl;
+    }},
+    // 4 — pen-spinning
+    { name: 'pen-spinning', play: () => {
+        setExpr('focused');
+        const tl = gsap.timeline({ defaults: { ease: 'power2.inOut' } });
+        tl.to(armR,   { rotation: -20, duration: 0.5, ease: 'back.out(1.4)' }, 0);
+        tl.to(armL,   { rotation:   5, duration: 0.5, ease: 'back.out(1.4)' }, 0);
+        tl.to(pen,    { opacity: 1, scale: 1, duration: 0.45, ease: 'back.out(2)' }, 0.2);
+        tl.to(typing, { opacity: 1, duration: 0.4 }, 0.4);
+        tl.to(aura,   { opacity: 0.75, duration: 0.5 }, 0);
+
+        const spin = gsap.to(pen, { rotation: '+=360', duration: 0.7, repeat: -1, ease: 'none', transformOrigin: '43px 60px' });
+        activeTimelines.push(spin);
+
+        const bob = gsap.timeline({ repeat: -1, yoyo: true });
+        bob.to(mascot, { y: -3, duration: 1.2, ease: 'sine.inOut' });
+        activeTimelines.push(bob);
+
+        const nod = gsap.timeline({ repeat: -1, repeatDelay: 1.7 });
+        nod.to(head, { y: -3, duration: 0.25, ease: 'power2.out' })
+           .to(head, { y:  0, duration: 0.25, ease: 'power2.in' });
+        activeTimelines.push(nod);
+
+        [type1, type2, type3].forEach((dot, i) => {
+          const d = gsap.timeline({ repeat: -1, delay: i * 0.25 });
+          d.to(dot, { opacity: 0.25, duration: 0.25 }).to(dot, { opacity: 1, duration: 0.25 }).to({}, { duration: 0.55 });
           activeTimelines.push(d);
         });
 
@@ -653,7 +798,7 @@
   /* ============================================================ FOUND */
   const playFound = () => {
     const tl = gsap.timeline({ defaults: { ease: 'power3.out' } });
-    tl.to([orbit, tablet, mag, drawer, map, scaleG, typing, think], { opacity: 0, duration: 0.3 }, 0);
+    tl.to([orbit, tablet, mag, pen, notepad, drawer, map, scaleG, typing, think], { opacity: 0, duration: 0.3 }, 0);
     tl.to(chunks, { opacity: 0, scale: 0, duration: 0.3, stagger: 0.03, ease: 'power2.in' }, 0);
 
     tl.call(() => setExpr('happy'), null, 0.3);
@@ -737,7 +882,13 @@
     searching:  'Suche in Dokumenten…',
     analyzing:  'Analysiere Inhalte…',
     reranking:  'Bewerte Relevanz…',
-    generating: 'Schreibe Antwort…',
+    generating: [
+      'Schreibe Antwort…',    // typing-fast
+      'Verarbeite tief…',     // deep-focus
+      'Formuliere Antwort…',  // pen-writing
+      'Denke nach…',          // pen-thinking
+      'Gleich fertig…',       // pen-spinning
+    ],
     found:      'Antwort gefunden!',
     error:      'Etwas ist schiefgelaufen.',
   };
@@ -754,16 +905,23 @@
 
   window.mascot = {
     setState,
+    triggerEgg(idx) {
+      if (idx >= 0 && idx < idleEggs.length) activeTimelines.push(idleEggs[idx].play());
+    },
     get state()   { return currentState; },
     get variant() { return currentVariant; },
-    get caption() { return CAPTIONS[currentState] || ''; },
+    get caption() {
+      const c = CAPTIONS[currentState];
+      if (Array.isArray(c)) return c[currentVariant] || c[0];
+      return c || '';
+    },
     onStateChange(fn) { listeners.push(fn); },
   };
 
   const captionEl = document.getElementById('dxm-caption');
   if (captionEl) {
     window.mascot.onStateChange((s) => {
-      captionEl.textContent  = CAPTIONS[s] || '';
+      captionEl.textContent   = window.mascot.caption;
       captionEl.style.opacity = s === 'idle' ? '0' : '1';
     });
   }

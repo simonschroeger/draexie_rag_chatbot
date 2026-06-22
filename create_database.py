@@ -420,6 +420,39 @@ def _build_chunks(
     return split_text + figure_chunks
 
 
+def _extract_docx_links(file_path: str, source_name: str) -> list[Document]:
+    """Return a Document chunk listing all hyperlinks found in a DOCX file."""
+    from docx import Document as DocxDocument
+    from docx.oxml.ns import qn
+
+    links: list[tuple[str, str]] = []
+    try:
+        doc = DocxDocument(file_path)
+        for paragraph in doc.paragraphs:
+            for hyperlink in paragraph._element.iter(qn("w:hyperlink")):
+                r_id = hyperlink.get(qn("r:id"))
+                if r_id and r_id in doc.part.rels:
+                    rel = doc.part.rels[r_id]
+                    if "hyperlink" in rel.reltype:
+                        url = rel.target_ref
+                        text = "".join(t.text for t in hyperlink.iter(qn("w:t"))).strip()
+                        if url:
+                            links.append((text, url))
+    except Exception:
+        pass
+
+    if not links:
+        return []
+
+    link_lines = "\n".join(
+        f"- {text}: {url}" if text else f"- {url}" for text, url in links
+    )
+    return [Document(
+        page_content=f"Verweise und Links in {source_name}:\n{link_lines}",
+        metadata={"source": source_name, "chunk_type": "text"},
+    )]
+
+
 # ── Worker process ─────────────────────────────────────────────────────────────
 
 _WORKER_CONVERTER: DocumentConverter | None = None
@@ -464,6 +497,8 @@ def _process_one(
         safe_stem = f"{path.stem}_{path.suffix.lstrip('.')}"
         ref_map = _extract_images(dl_doc, safe_stem, Path(image_store_str))
         chunks = _build_chunks(dl_doc, path.name, ref_map, splitter)
+        if path.suffix.lower() == ".docx":
+            chunks.extend(_extract_docx_links(str(path), path.name))
         return (
             path.name,
             [{"page_content": c.page_content, "metadata": c.metadata} for c in chunks],
