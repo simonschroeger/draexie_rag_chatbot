@@ -12,7 +12,7 @@ import { marked } from 'marked';
 import markedKatex from 'marked-katex-extension';
 import 'katex/dist/katex.min.css';
 import DOMPurify from 'dompurify';
-import { RagMessage, Conversation, HealthStatus, ServerEvent, Chunk } from './types';
+import { RagMessage, Conversation, ServerEvent, Chunk } from './types';
 import Mascot from './components/Mascot';
 
 // ── i18n ──────────────────────────────────────────────────────────────────────
@@ -31,7 +31,6 @@ const translations = {
     unnamed:           'Unbenanntes Gespräch',
     systemReady:       'System bereit',
     unavailable:       'Nicht verfügbar',
-    lastImported:      'Zuletzt importiert',
     messages:          (n: number) => `${n} Nachrichten in diesem Gespräch`,
     sources:           (n: number) => `Quellen (${n})`,
     sourcesTab:        'Quellen',
@@ -110,7 +109,6 @@ const translations = {
     unnamed:           'Unnamed conversation',
     systemReady:       'System ready',
     unavailable:       'Unavailable',
-    lastImported:      'Last imported',
     messages:          (n: number) => `${n} messages in this chat`,
     sources:           (n: number) => `Sources (${n})`,
     sourcesTab:        'Sources',
@@ -1071,7 +1069,7 @@ export default function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [convSearch, setConvSearch] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [health, setHealth] = useState<HealthStatus | null>(null);
+
   const [uploadOpen, setUploadOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<'sources'>('sources');
   const [panelMsgId, setPanelMsgId] = useState<string | null>(null);
@@ -1168,19 +1166,6 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inChatDebouncedQuery]); // only fire when debounced query changes
 
-  // ── Health poll ────────────────────────────────────────────────────────────
-  const pollHealth = useCallback(async () => {
-    try {
-      const data: HealthStatus = await (await fetch('/health')).json();
-      setHealth(data);
-    } catch { /* ignore */ }
-  }, []);
-
-  useEffect(() => {
-    pollHealth();
-    const id = setInterval(pollHealth, 30_000);
-    return () => clearInterval(id);
-  }, [pollHealth]);
 
   // ── Scroll-to-message (triggered after search result click) ───────────────
   useEffect(() => {
@@ -1382,7 +1367,6 @@ export default function App() {
           if (rows.some(r => r.filename === file.name && r.status === 'ok')) {
             clearInterval(poll);
             setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'ready' as const } : a) as Attachment[]);
-            pollHealth();
           }
         } catch { clearInterval(poll); }
       }, 3000);
@@ -1390,7 +1374,7 @@ export default function App() {
     } catch {
       setAttachments(prev => prev.map(a => a.id === id ? { ...a, kind: 'file' as const, status: 'error' as const } : a) as Attachment[]);
     }
-  }, [pollHealth]);
+  }, []);
 
   // ── Send message ───────────────────────────────────────────────────────────
   const sendMessage = async (question?: string) => {
@@ -1655,14 +1639,6 @@ export default function App() {
         <div className="flex items-center justify-between p-4 border-b border-outline-variant shrink-0">
           <h1 className="text-base font-bold tracking-tight">DRÄXIE</h1>
           <div className="flex items-center gap-2">
-            <button
-              onClick={() => setLang(lang === 'de' ? 'en' : 'de')}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider border border-outline-variant text-on-surface-variant hover:bg-surface-container-high transition-colors"
-              title={lang === 'de' ? 'Switch to English' : 'Zu Deutsch wechseln'}
-            >
-              <Languages size={11} />
-              {lang === 'de' ? 'EN' : 'DE'}
-            </button>
             {/* Desktop collapse button */}
             <button
               onClick={() => setLeftCollapsed(true)}
@@ -1830,12 +1806,6 @@ export default function App() {
 
         {/* ── Sidebar footer ───────────────────────────────────────────────────── */}
         <div className="px-4 py-3 border-t border-outline-variant shrink-0">
-          {health?.last_ingestion && (
-            <div className="space-y-0.5 mb-2">
-              <p className="text-[9px] uppercase tracking-wider text-on-surface-variant/40 font-mono">{t.lastImported}</p>
-              <p className="text-[11px] text-on-surface truncate">{health.last_ingestion.filename}</p>
-            </div>
-          )}
           {messageCount > 0 && (
             <p className="text-[11px] text-on-surface-variant">{t.messages(messageCount)}</p>
           )}
@@ -1844,8 +1814,16 @@ export default function App() {
               Gesprächskontext: {messageCount} Nachrichten
             </p>
           )}
-          {/* Light/dark toggle */}
-          <div className="mt-3 flex justify-end">
+          {/* Lang + theme toggles */}
+          <div className="mt-3 flex justify-end items-center gap-1">
+            <button
+              onClick={() => setLang(lang === 'de' ? 'en' : 'de')}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider border border-outline-variant text-on-surface-variant hover:bg-surface-container-high transition-colors"
+              title={lang === 'de' ? 'Switch to English' : 'Zu Deutsch wechseln'}
+            >
+              <Languages size={11} />
+              {lang === 'de' ? 'EN' : 'DE'}
+            </button>
             <button
               onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
               className="p-1.5 rounded-lg text-on-surface-variant/50 hover:text-on-surface-variant hover:bg-surface-container-highest transition-all"
@@ -1915,35 +1893,139 @@ export default function App() {
           />
         )}
 
+        {/* ── Start screen — centered input ───────────────────────────────────── */}
+        {messages.length === 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}
+            className="flex-1 flex flex-col items-center justify-center px-4 pb-4 min-h-0"
+          >
+            <div className="w-full max-w-2xl flex flex-col gap-5">
+
+              {/* Title */}
+              <div className="text-center">
+                <h2 className="text-3xl font-bold mb-2">{t.welcomeTitle}</h2>
+                <p className="text-sm text-on-surface-variant">{t.welcomeSubtitle}</p>
+              </div>
+
+              {/* Attachment preview */}
+              <AnimatePresence>
+                {attachments.length > 0 && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 6 }}
+                    className="flex gap-2 overflow-x-auto pb-1 custom-scrollbar"
+                  >
+                    {attachments.map(att => (
+                      <AttachmentCard
+                        key={att.id}
+                        att={att}
+                        onRemove={() => setAttachments(prev => prev.filter(a => a.id !== att.id))}
+                      />
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Input pill */}
+              <div className="relative bg-surface-container/90 backdrop-blur-xl border border-outline-variant rounded-2xl shadow-2xl transition-all focus-within:ring-2 focus-within:ring-primary-container/30">
+                <div className="flex items-end gap-2 p-1.5">
+                  <div className="relative shrink-0">
+                    {showOnboarding && (
+                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2.5 w-56 bg-surface-container-highest border border-outline-variant rounded-xl px-3 py-2.5 shadow-xl z-50 pointer-events-none">
+                        <p className="text-[10px] text-on-surface leading-relaxed">
+                          Eigene Dokumente hinzufügen — klicke hier oder ziehe Dateien ins Chatfenster
+                        </p>
+                        <div className="absolute top-full left-1/2 -translate-x-1/2 w-0 h-0 border-x-4 border-x-transparent border-t-4 border-t-outline-variant" />
+                      </div>
+                    )}
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="p-2 text-on-surface-variant hover:text-primary-container hover:bg-surface-container-highest rounded-xl transition-all"
+                      title={t.attachFile}
+                    >
+                      <Paperclip size={17} />
+                    </button>
+                  </div>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    className="hidden"
+                    accept=".pdf,.docx,.pptx,.xlsx,.txt,.md,.png,.jpg,.jpeg,.webp"
+                    onChange={e => { Array.from(e.target.files ?? []).forEach(f => createFileAttachment(f)); e.target.value = ''; }}
+                  />
+                  <div className="flex-1 relative">
+                    <textarea
+                      ref={inputRef}
+                      rows={1}
+                      value={input}
+                      placeholder={placeholder.text}
+                      className="w-full bg-transparent border-none focus:ring-0 text-sm p-2 resize-none leading-relaxed transition-opacity duration-400"
+                      style={{
+                        maxHeight: 140,
+                        overflowY: 'auto',
+                        placeholderColor: 'var(--color-on-surface-variant)',
+                        opacity: input.length > 0 ? 1 : (placeholder.visible ? 1 : 0.3),
+                      } as React.CSSProperties}
+                      onChange={e => {
+                        setInput(e.target.value);
+                        e.target.style.height = 'auto';
+                        e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px';
+                      }}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+                      }}
+                      onPaste={e => {
+                        const text = e.clipboardData.getData('text');
+                        if (text.length > 200) {
+                          e.preventDefault();
+                          setAttachments(prev => [...prev, { id: crypto.randomUUID(), kind: 'paste', text }]);
+                        }
+                      }}
+                    />
+                    {charCount > 3500 && (
+                      <span className={`absolute bottom-1 right-2 text-[10px] font-mono pointer-events-none ${charCount >= CHAR_LIMIT ? 'text-red-400' : charCount >= 3800 ? 'text-amber-400' : 'text-on-surface-variant/40'}`}>
+                        {charCount.toLocaleString()} / {CHAR_LIMIT.toLocaleString()}
+                      </span>
+                    )}
+                  </div>
+                  {isStreaming ? (
+                    <button onClick={stopGeneration} className="p-2.5 bg-surface-container-highest border border-outline-variant text-on-surface-variant rounded-xl hover:text-on-surface hover:border-on-surface-variant/40 active:scale-95 transition-all shrink-0" title={t.stopGenerating}>
+                      <Square size={14} fill="currentColor" />
+                    </button>
+                  ) : (
+                    <button onClick={() => sendMessage()} disabled={!input.trim() || charCount > CHAR_LIMIT} className="p-2.5 bg-primary-container text-white rounded-xl shadow-lg hover:brightness-110 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed shrink-0">
+                      <ArrowUp size={16} />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Suggested questions — plain text, no boxes */}
+              <div className="flex flex-col items-center gap-0.5 pt-1">
+                {shownQuestions.map(q => (
+                  <button
+                    key={q}
+                    onClick={() => sendMessage(q)}
+                    className="text-[13px] text-on-surface-variant/70 hover:text-on-surface transition-colors py-1.5 px-3 rounded-lg hover:bg-surface-container-highest w-full text-center"
+                  >
+                    {q}
+                  </button>
+                ))}
+              </div>
+
+              {/* Footer hints */}
+              <p className="text-[10px] text-center text-on-surface-variant/30 select-none font-mono">{t.inputHints}</p>
+            </div>
+          </motion.div>
+        )}
+
         {/* Chat area */}
-        <div
+        {messages.length > 0 && <div
           ref={chatAreaRef}
           onScroll={handleChatScroll}
           className="flex-1 overflow-y-auto custom-scrollbar p-4 md:p-8 relative"
         >
           <div className="max-w-3xl mx-auto space-y-8 pb-56">
 
-            {/* Welcome */}
-            {messages.length === 0 && (
-              <motion.div
-                initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}
-                className="text-center pt-12"
-              >
-                <h2 className="text-2xl font-bold mb-2">{t.welcomeTitle}</h2>
-                <p className="text-sm text-on-surface-variant mb-8">{t.welcomeSubtitle}</p>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-xl mx-auto text-left">
-                  {shownQuestions.map(q => (
-                    <button
-                      key={q}
-                      onClick={() => sendMessage(q)}
-                      className="text-left px-4 py-3 bg-surface-container border border-outline-variant rounded-xl text-[12px] text-on-surface-variant hover:text-on-surface hover:border-primary-container/40 hover:bg-surface-container-high transition-all"
-                    >
-                      {q}
-                    </button>
-                  ))}
-                </div>
-              </motion.div>
-            )}
 
             {/* Messages */}
             <AnimatePresence mode="popLayout">
@@ -1973,7 +2055,7 @@ export default function App() {
                     </div>
                   ) : (
                     (() => {
-                      const isNoAnswer = msg.content.includes('Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden');
+                      const isNoAnswer = msg.content.includes('Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden') || msg.content.includes("I couldn't find anything on that in the available documents");
                       return (
                         <div className="w-full space-y-1 group">
                           {/* Header label */}
@@ -2050,13 +2132,14 @@ export default function App() {
 
             <div ref={chatEndRef} />
           </div>
-        </div>
+        </div>}
 
-        {/* Mascot — bottom-right corner, above the input bar, never over text */}
+        {/* Mascot — always mounted so GSAP element refs stay valid across new-chat resets */}
         <div className="absolute bottom-40 right-3 z-30 pointer-events-none">
           <Mascot />
         </div>
 
+        {messages.length > 0 && <>
         {/* ── Input area ──────────────────────────────────────────────────────── */}
         <div className="absolute bottom-0 left-0 right-0 z-30 pointer-events-none">
           <div className="px-4 pb-4 pointer-events-auto">
@@ -2195,6 +2278,7 @@ export default function App() {
             </motion.button>
           )}
         </AnimatePresence>
+        </>}
 
       </main>
 
@@ -2255,7 +2339,7 @@ export default function App() {
       {uploadOpen && (
         <UploadModal
           onClose={() => setUploadOpen(false)}
-          onSuccess={() => setTimeout(pollHealth, 3000)}
+          onSuccess={() => {}}
         />
       )}
     </div>

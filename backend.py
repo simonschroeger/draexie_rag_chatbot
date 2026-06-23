@@ -107,7 +107,17 @@ def _save_message_sources(conv_id: str, msg_idx: int, sources: list, chunks: lis
 
 # ── Ingestion helpers (shared by create_database path and POST /documents) ────
 
-_VISUAL_LABELS = {DocItemLabel.PICTURE, DocItemLabel.CHART}
+_VISUAL_LABELS   = {DocItemLabel.PICTURE, DocItemLabel.CHART}
+
+# Heuristic thresholds for decorative-image rejection at ingestion time.
+# Images that fail either check are never saved to disk or described by the vision model.
+_IMG_MIN_DIM     = 150    # skip if BOTH width and height are below this (icons, bullets)
+_IMG_MAX_ASPECT  = 10.0   # skip if max/min dimension ratio exceeds this (decorative lines)
+
+# Relevance gate — if the best text-chunk score for a question is below this, the LLM
+# is never called and the no-answer string is streamed directly.  Tune downward if
+# legitimate questions are being blocked; tune upward to reject more off-topic queries.
+_MIN_TEXT_RELEVANCE = 0.40
 
 # One converter instance — reused for both startup indexing and live uploads.
 _converter = DocumentConverter()
@@ -123,18 +133,45 @@ def _extract_images(
     dl_doc: DoclingDocument,
     source_stem: str,
 ) -> dict[str, str]:
-    """Save PictureItems as PNG and return {self_ref -> image_path}."""
+    """Save PictureItems as PNG and return {self_ref -> image_path}.
+
+    Images are filtered before saving:
+    - Skipped if both dimensions are below _IMG_MIN_DIM (icons, bullet points).
+    - Skipped if the aspect ratio exceeds _IMG_MAX_ASPECT (decorative lines/banners).
+    """
     image_store = Path(config.IMAGE_STORE_PATH)
     image_store.mkdir(parents=True, exist_ok=True)
     ref_to_path: dict[str, str] = {}
     fig_idx = 0
     for item, _level in dl_doc.iterate_items():
         if isinstance(item, PictureItem):
-            img = item.get_image(dl_doc)
-            if img is not None:
-                out_path = image_store / f"{source_stem}__fig{fig_idx:04d}.png"
-                img.save(out_path, "PNG")
-                ref_to_path[item.self_ref] = str(out_path)
+            try:
+                img = item.get_image(dl_doc)
+            except Exception:
+                fig_idx += 1
+                continue
+
+            if img is None:
+                fig_idx += 1
+                continue
+
+            w, h = img.size
+            # Reject degenerate images
+            if w == 0 or h == 0:
+                fig_idx += 1
+                continue
+            # Reject tiny decorative images (icons, bullets, small logos)
+            if w < _IMG_MIN_DIM and h < _IMG_MIN_DIM:
+                fig_idx += 1
+                continue
+            # Reject extreme-aspect-ratio images (horizontal/vertical decorative lines)
+            if max(w, h) / min(w, h) > _IMG_MAX_ASPECT:
+                fig_idx += 1
+                continue
+
+            out_path = image_store / f"{source_stem}__fig{fig_idx:04d}.png"
+            img.save(out_path, "PNG")
+            ref_to_path[item.self_ref] = str(out_path)
             fig_idx += 1
     return ref_to_path
 
@@ -304,18 +341,40 @@ llm = ChatOllama(
     base_url=config.OLLAMA_BASE_URL,
     model=config.LLM_MODEL,
     temperature=0.3,
+    num_ctx=config.LLM_NUM_CTX,
 )
 
 base_retriever = vectorstore.as_retriever(search_kwargs={"k": config.TOP_K})
 
 _expand_chain = (
     ChatPromptTemplate.from_template(
-        "Generate 2 alternative phrasings of this search query. "
-        "Return only the queries, one per line, no numbering.\n\nQuery: {question}"
+        "You are a multilingual query expansion assistant for a bilingual (German/English) document corpus.\n"
+        "Detect the language of the search query below.\n"
+        "Generate exactly 3 alternative phrasings following this rule:\n"
+        "  - If the query is in German: produce 2 alternatives in German and 1 alternative translated into English.\n"
+        "  - If the query is in English: produce 2 alternatives in English and 1 alternative translated into German.\n"
+        "The cross-language alternative must be the last element.\n"
+        "Return ONLY a valid JSON array of exactly 3 strings, with no extra text:\n"
+        "[\"alternative1\", \"alternative2\", \"cross_language_alternative\"]\n\n"
+        "Query: {question}"
     )
     | llm
     | StrOutputParser()
 )
+
+
+def _parse_expand_alternatives(raw: str) -> list[str]:
+    """Extract JSON array of alternative queries from LLM output."""
+    start = raw.find("[")
+    end   = raw.rfind("]")
+    if start == -1 or end == -1:
+        return []
+    try:
+        items = json.loads(raw[start:end + 1])
+        return [s.strip() for s in items if isinstance(s, str) and s.strip()]
+    except Exception:
+        # Fallback: treat each non-empty line as an alternative
+        return [ln.strip() for ln in raw.splitlines() if ln.strip()]
 
 _suggest_chain = (
     ChatPromptTemplate.from_template(
@@ -355,10 +414,9 @@ def multi_retrieve(question: str) -> tuple[list, list]:
     images appear because their document was relevant, not because the image
     description happened to score well.
     """
-    from qdrant_client.models import Filter, FieldCondition, MatchAny
-
-    extras = _expand_chain.invoke({"question": question})
-    queries = [question] + [q.strip() for q in extras.splitlines() if q.strip()]
+    raw_expand  = _expand_chain.invoke({"question": question})
+    alternatives = _parse_expand_alternatives(raw_expand)          # 3 items: 2 same-lang + 1 cross-lang
+    queries = [question] + alternatives                             # 4 queries total
     seen, text_docs = set(), []
     for q in queries:
         for doc in base_retriever.invoke(q):
@@ -368,36 +426,30 @@ def multi_retrieve(question: str) -> tuple[list, list]:
                 seen.add(doc.page_content)
                 text_docs.append(doc)
 
-    # Fetch up to 2 images per cited source document (not by score — by source match)
-    cited_sources = list({d.metadata.get("source", "") for d in text_docs if d.metadata.get("source")})
+    # Score-gated figure retrieval — only images that genuinely match the query
+    # clear the threshold; everything else is silently dropped.
     figure_docs: list = []
-    if cited_sources:
-        try:
-            points, _ = _qdrant_client.scroll(
-                collection_name=config.COLLECTION,
-                scroll_filter=Filter(must=[
-                    FieldCondition(key="metadata.chunk_type", match=MatchAny(any=["figure"])),
-                    FieldCondition(key="metadata.source",     match=MatchAny(any=cited_sources)),
-                ]),
-                limit=len(cited_sources) * 2,
-                with_payload=True,
-                with_vectors=False,
-            )
-            seen_sources: dict[str, int] = {}
-            for pt in points:
-                src = pt.payload.get("metadata", {}).get("source", "")
-                img = pt.payload.get("metadata", {}).get("image_path", "")
-                if not img or not Path(img).exists():
-                    continue
-                if seen_sources.get(src, 0) >= 2:
-                    continue
-                seen_sources[src] = seen_sources.get(src, 0) + 1
-                figure_docs.append(Document(
-                    page_content=pt.payload.get("page_content", ""),
-                    metadata=pt.payload.get("metadata", {}),
-                ))
-        except Exception:
-            pass
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        fig_filter = Filter(must=[
+            FieldCondition(key="metadata.chunk_type", match=MatchValue(value="figure"))
+        ])
+        fig_results = vectorstore.similarity_search_with_relevance_scores(
+            query=question,
+            k=20,
+            filter=fig_filter,
+        )
+        for doc, score in fig_results:
+            if score <= _MIN_FIGURE_SCORE:
+                continue
+            img = doc.metadata.get("image_path", "")
+            if not img or not Path(img).exists():
+                continue
+            figure_docs.append(doc)
+            if len(figure_docs) >= _MAX_FIGURE_RESULTS:
+                break
+    except Exception:
+        pass
 
     return text_docs, figure_docs
 
@@ -434,8 +486,10 @@ def repair_gemma_formatting(text: str) -> str:
 _SYSTEM_PROMPT = """\
 You are DRÄXIE, a precise onboarding assistant for DRÄXLMAIER sales staff.
 
-GROUNDING RULES
-- Answer using only the information in the provided document excerpts.
+GROUNDING RULES — ABSOLUTE, NO EXCEPTIONS
+- You have NO general knowledge. Your training data does not exist in this context. The ONLY facts you may state are those explicitly present in the document excerpts provided below.
+- NEVER answer from memory, training data, or world knowledge — even if you are certain of the answer. This applies to every topic: people, companies, history, science, politics, geography, or anything else.
+- If the question cannot be answered from the excerpts alone, you MUST use the no-answer sentence. No partial guesses. No "based on general knowledge". Silence on everything outside the excerpts.
 - Every sentence that states a fact MUST end with its source marker [N] (e.g. [1], [2]). No exceptions. If a sentence draws on multiple excerpts, cite each separately with no space: [1][3]. Never write [1, 3] or [1,3].
 - Use only sequential [1], [2], [3] … markers — they correspond to the numbered Quellen entries shown to the user.
 - When asked for specific numbers, deadlines, names, or lists, state them directly and exactly as they appear in the documents.
@@ -444,7 +498,8 @@ GROUNDING RULES
 LINKS AND REFERENCES
 - If the document excerpts contain hyperlinks or references to other documents, always include them verbatim in your answer so the user can follow them directly.
 
-WHEN THE DOCUMENTS ARE INCOMPLETE
+WHEN THE DOCUMENTS ARE INCOMPLETE OR OFF-TOPIC
+- If the question is about a person, event, organization, or topic that does not appear anywhere in the excerpts, respond IMMEDIATELY with only the no-answer sentence. Do not attempt to answer.
 - If the documents fully answer the question, answer completely.
 - If the documents only partially answer it, give what the documents support, then clearly state what is missing. If relevant links to further resources appear in the excerpts, include them.
 - If the documents do not answer the question at all, use this exact sentence (German): "Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden." — do not paraphrase it.
@@ -522,7 +577,7 @@ CONVERSATION
 _answer_prompt = ChatPromptTemplate.from_messages([
     ("system", _SYSTEM_PROMPT),
     MessagesPlaceholder(variable_name="history"),
-    ("human", "Unterlagen:\n{context}\n\nFrage: {question}"),
+    ("human", "Unterlagen:\n{context}\n\nANWEISUNG: Beantworte ausschließlich auf Basis der Unterlagen oben. Wenn das Thema der Frage dort nicht vorkommt, antworte NUR mit: \"Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden.\" Kein Allgemeinwissen, keine eigene Recherche.\n\nFrage: {question}"),
 ])
 
 _chain_with_history = RunnableWithMessageHistory(
@@ -582,8 +637,77 @@ async def mascot_js():
     return FileResponse("frontend/dist/draexie-mascot.js", media_type="application/javascript")
 
 
+_NO_ANSWER_DE = "Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden."
+_NO_ANSWER_EN = "I couldn't find anything on that in the available documents."
+
+# Phrases the LLM produces when it can't find an answer (instead of our canonical text).
+_NO_ANSWER_TRIGGERS = [
+    "keine informationen", "nicht gefunden", "nicht in den unterlagen",
+    "nicht in den bereitgestellten", "nicht in meinen", "leider nichts",
+    "keine angaben", "nicht enthalten", "nicht verfügbar", "nicht vorhanden",
+    "i couldn't find", "no information", "not found in", "cannot find",
+    "not available in", "not mentioned in", "no relevant", "nothing found",
+    "keine relevanten", "nicht erwähnt", "nicht behandelt",
+]
+
+
+_EN_MARKERS = {"what", "who", "where", "when", "why", "how", "is", "are",
+               "was", "were", "does", "did", "can", "could", "would", "tell",
+               "explain", "describe", "give", "show", "list", "find", "the", "a"}
+
+
+def _detect_language(text: str) -> str:
+    """Return 'en' if the text is predominantly English, otherwise 'de'."""
+    words = set(re.findall(r"[a-zA-ZäöüÄÖÜß]+", text.lower()))
+    en_hits = len(words & _EN_MARKERS)
+    # Common unambiguous German words that don't appear in English
+    de_hits = len(words & {"wie", "welche", "welcher", "welches", "warum",
+                            "wann", "können", "gibt", "sind", "haben", "bitte",
+                            "erkläre", "zeige", "nenne", "beschreibe"})
+    return "en" if en_hits > de_hits else "de"
+
+
+def _normalize_no_answer(text: str, question: str) -> str:
+    """Replace LLM no-answer paraphrases with our canonical sentence.
+
+    If the response contains citation markers ([1], [2] …) it found relevant
+    content — leave it untouched.  Otherwise, if it matches any known
+    no-answer phrasing, replace with the correct DE or EN canonical string.
+    """
+    if re.search(r'\[\d+\]', text):
+        return text  # has citations → real answer, don't touch
+    lower = text.lower()
+    if any(t in lower for t in _NO_ANSWER_TRIGGERS):
+        return _NO_ANSWER_EN if _detect_language(question) == "en" else _NO_ANSWER_DE
+    return text
+
+
+def _best_text_score(question: str) -> float:
+    """Return the highest relevance score any text chunk scores against the question.
+    Used as a fast off-topic gate — avoids calling the LLM for irrelevant queries."""
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        results = vectorstore.similarity_search_with_relevance_scores(
+            question, k=1,
+            filter=Filter(must=[FieldCondition(key="metadata.chunk_type", match=MatchValue(value="text"))])
+        )
+        return results[0][1] if results else 0.0
+    except Exception:
+        return 1.0  # fail open — let the LLM handle it
+
+
 @app.post("/chat")
 def chat(req: ChatRequest):
+    # Off-topic gate: if no text chunk scores above the threshold, skip the LLM entirely.
+    best_score = _best_text_score(req.question)
+    if best_score < _MIN_TEXT_RELEVANCE:
+        no_ans = _NO_ANSWER_EN if _detect_language(req.question) == "en" else _NO_ANSWER_DE
+        def _nope():
+            yield f"data: {json.dumps({'sources': [], 'chunks': []})}\n\n"
+            yield f"data: {json.dumps({'token': no_ans})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'suggestions': []})}\n\n"
+        return StreamingResponse(_nope(), media_type="text/event-stream")
+
     text_docs, figure_docs = multi_retrieve(req.question)
 
     # Sources: unique filenames from text docs only (ground truth)
@@ -630,14 +754,15 @@ def chat(req: ChatRequest):
             b64_images = [b for p in image_paths if (b := _image_to_b64(p)) is not None]
 
             history_obj  = get_session_history(req.conversation_id)
-            history_msgs = history_obj.messages
+            # Keep only the last 10 messages (5 turns) so old history never blows the context window
+            history_msgs = history_obj.messages[-10:]
 
             # Gemma 4: images before text for optimal multimodal attention
             human_content: list[dict] = [
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}}
                 for b in b64_images
             ] + [
-                {"type": "text", "text": f"Kontext:\n{context}\n\nFrage: {req.question}"},
+                {"type": "text", "text": f"Kontext:\n{context}\n\nANWEISUNG: Beantworte ausschließlich auf Basis der Unterlagen oben. Wenn das Thema der Frage dort nicht vorkommt, antworte NUR mit: \"Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden.\" Kein Allgemeinwissen, keine eigene Recherche.\n\nFrage: {req.question}"},
             ]
 
             messages = [
@@ -651,7 +776,7 @@ def chat(req: ChatRequest):
                 tok = chunk.content if hasattr(chunk, "content") else str(chunk)
                 if tok:
                     full_answer += tok
-            full_answer = repair_gemma_formatting(full_answer)
+            full_answer = _normalize_no_answer(repair_gemma_formatting(full_answer), req.question)
             yield f"data: {json.dumps({'token': full_answer})}\n\n"
 
             # Persist turn to conversation history manually
@@ -668,7 +793,7 @@ def chat(req: ChatRequest):
                 config={"configurable": {"session_id": req.conversation_id}},
             ):
                 full_answer += token
-            full_answer = repair_gemma_formatting(full_answer)
+            full_answer = _normalize_no_answer(repair_gemma_formatting(full_answer), req.question)
             yield f"data: {json.dumps({'token': full_answer})}\n\n"
             history_after = get_session_history(req.conversation_id)
             _save_message_sources(req.conversation_id, len(history_after.messages) - 1, sources, chunks)

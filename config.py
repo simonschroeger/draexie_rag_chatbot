@@ -14,3 +14,7 @@ CHUNK_OVERLAP: int       = int(os.getenv("CHUNK_OVERLAP", "64"))
 IMAGE_STORE_PATH: str    = os.getenv("IMAGE_STORE_PATH", "./data/images")
 VISION_TOKEN_BUDGET: int = int(os.getenv("VISION_TOKEN_BUDGET", "560"))
 DOCS_DIR: str            = os.getenv("DOCS_DIR", "./data")
+# Ollama KV-cache context window.  Gemma4 27B supports 128k natively;
+# 65536 is a safe default that fits 2 vision images + long conversations.
+# Lower this (e.g. 32768) if you are VRAM-constrained.
+LLM_NUM_CTX: int         = int(os.getenv("LLM_NUM_CTX", "32768"))
