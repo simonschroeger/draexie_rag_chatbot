@@ -1,6 +1,0 @@
-{
-  "name": "Draexie Analytical Engine",
-  "description": "A high-precision AI dashboard for data analysis and generative UI orchestration.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
