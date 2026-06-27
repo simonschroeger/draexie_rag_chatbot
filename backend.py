@@ -1,7 +1,8 @@
 """
-DRÄXIE API  —  FastAPI + LangChain RAG pipeline.
-Run with:  uvicorn backend:app --reload
+DRÄXIE API — FastAPI + LangChain RAG pipeline.
+Run with: uvicorn backend:app --reload
 """
+
 import base64
 import io
 import json
@@ -38,13 +39,38 @@ from PIL import Image as PILImage
 
 import config
 
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# Labels that identify visual elements (figures/charts) inside parsed documents
+_VISUAL_LABELS = {DocItemLabel.PICTURE, DocItemLabel.CHART}
+
+# Image filtering thresholds applied at ingestion time.
+# Images failing either check are skipped entirely — never saved or described.
+_IMG_MIN_DIM    = 150   # skip if BOTH width AND height are below this (icons, bullet symbols)
+_IMG_MAX_ASPECT = 10.0  # skip if longest side / shortest side exceeds this (decorative lines)
+
+# Relevance gate for the off-topic guard.
+# If the best matching text chunk scores below this threshold, the LLM is skipped
+# entirely and the "nothing found" answer is returned immediately.
+# Tune down to allow more questions through; tune up to be stricter.
+_MIN_TEXT_RELEVANCE = 0.40
+
+# How many figure chunks to attach to a response at most, and the minimum
+# relevance score a figure chunk must reach to be included at all.
+_MAX_FIGURE_RESULTS = 3
+_MIN_FIGURE_SCORE   = 0.45
+
+
 # ── Databases ─────────────────────────────────────────────────────────────────
 
-CONV_DB  = "sqlite:///conversations.db"
-META_DB  = "draxie.db"
+# SQLite connection strings / paths
+CONV_DB = "sqlite:///conversations.db"   # stores full conversation history (LangChain managed)
+META_DB = "draxie.db"                    # stores feedback ratings and ingestion logs
 
 
 def init_db() -> None:
+    """Create the metadata tables on first startup if they don't exist yet."""
     con = sqlite3.connect(META_DB)
     con.executescript("""
         CREATE TABLE IF NOT EXISTS feedback (
@@ -68,20 +94,27 @@ def init_db() -> None:
     con.close()
 
 
+# Run once at import time so tables always exist before any request arrives
 init_db()
 
 
 def get_session_history(session_id: str) -> SQLChatMessageHistory:
+    """Return the LangChain message history object for a given conversation ID."""
     return SQLChatMessageHistory(session_id=session_id, connection=CONV_DB)
 
 
 def _ensure_conv_tables(con: sqlite3.Connection) -> None:
+    """
+    Create the two extra conversation tables if they don't exist yet.
+    These live in conversations.db (managed by LangChain) rather than draxie.db,
+    so they need their own creation guard.
+    """
     con.execute("""
         CREATE TABLE IF NOT EXISTS message_sources (
             conversation_id TEXT NOT NULL,
             msg_index       INTEGER NOT NULL,
-            sources         TEXT,
-            chunks          TEXT,
+            sources         TEXT,   -- JSON list of source filenames
+            chunks          TEXT,   -- JSON list of chunk objects shown to the user
             PRIMARY KEY (conversation_id, msg_index)
         )
     """)
@@ -95,6 +128,11 @@ def _ensure_conv_tables(con: sqlite3.Connection) -> None:
 
 
 def _save_message_sources(conv_id: str, msg_idx: int, sources: list, chunks: list) -> None:
+    """
+    Persist which source documents and chunk excerpts were used for a specific
+    assistant message. This lets the frontend re-display sources when loading
+    an old conversation.
+    """
     con = sqlite3.connect("conversations.db")
     _ensure_conv_tables(con)
     con.execute(
@@ -105,23 +143,14 @@ def _save_message_sources(conv_id: str, msg_idx: int, sources: list, chunks: lis
     con.close()
 
 
-# ── Ingestion helpers (shared by create_database path and POST /documents) ────
+# ── Document ingestion helpers ─────────────────────────────────────────────────
+# These functions are shared between create_database.py (bulk indexing)
+# and the live POST /documents upload endpoint.
 
-_VISUAL_LABELS   = {DocItemLabel.PICTURE, DocItemLabel.CHART}
-
-# Heuristic thresholds for decorative-image rejection at ingestion time.
-# Images that fail either check are never saved to disk or described by the vision model.
-_IMG_MIN_DIM     = 150    # skip if BOTH width and height are below this (icons, bullets)
-_IMG_MAX_ASPECT  = 10.0   # skip if max/min dimension ratio exceeds this (decorative lines)
-
-# Relevance gate — if the best text-chunk score for a question is below this, the LLM
-# is never called and the no-answer string is streamed directly.  Tune downward if
-# legitimate questions are being blocked; tune upward to reject more off-topic queries.
-_MIN_TEXT_RELEVANCE = 0.40
-
-# One converter instance — reused for both startup indexing and live uploads.
+# One Docling converter instance, reused across all ingestion calls
 _converter = DocumentConverter()
 
+# Text splitter used to break large text chunks into smaller pieces
 _splitter = RecursiveCharacterTextSplitter(
     chunk_size=config.CHUNK_SIZE,
     chunk_overlap=config.CHUNK_OVERLAP,
@@ -133,16 +162,20 @@ def _extract_images(
     dl_doc: DoclingDocument,
     source_stem: str,
 ) -> dict[str, str]:
-    """Save PictureItems as PNG and return {self_ref -> image_path}.
+    """
+    Walk every item in a parsed document and save qualifying PictureItems as PNG files.
 
-    Images are filtered before saving:
-    - Skipped if both dimensions are below _IMG_MIN_DIM (icons, bullet points).
-    - Skipped if the aspect ratio exceeds _IMG_MAX_ASPECT (decorative lines/banners).
+    Filtering rules (applied before saving):
+    - Skip images where both width AND height are below _IMG_MIN_DIM (icons, bullets)
+    - Skip images with an extreme aspect ratio above _IMG_MAX_ASPECT (decorative lines)
+
+    Returns a dict mapping each item's self_ref ID to its saved file path.
     """
     image_store = Path(config.IMAGE_STORE_PATH)
     image_store.mkdir(parents=True, exist_ok=True)
     ref_to_path: dict[str, str] = {}
     fig_idx = 0
+
     for item, _level in dl_doc.iterate_items():
         if isinstance(item, PictureItem):
             try:
@@ -156,15 +189,17 @@ def _extract_images(
                 continue
 
             w, h = img.size
-            # Reject degenerate images
+
             if w == 0 or h == 0:
                 fig_idx += 1
                 continue
-            # Reject tiny decorative images (icons, bullets, small logos)
+
+            # Skip tiny decorative elements (icons, bullet points, small logos)
             if w < _IMG_MIN_DIM and h < _IMG_MIN_DIM:
                 fig_idx += 1
                 continue
-            # Reject extreme-aspect-ratio images (horizontal/vertical decorative lines)
+
+            # Skip extreme-aspect-ratio images (horizontal/vertical decorative lines)
             if max(w, h) / min(w, h) > _IMG_MAX_ASPECT:
                 fig_idx += 1
                 continue
@@ -173,6 +208,7 @@ def _extract_images(
             img.save(out_path, "PNG")
             ref_to_path[item.self_ref] = str(out_path)
             fig_idx += 1
+
     return ref_to_path
 
 
@@ -182,9 +218,16 @@ def _build_chunks(
     ref_to_path: dict[str, str],
 ) -> list[Document]:
     """
-    Produce LangChain Documents from a DoclingDocument.
-    Figure chunks keep chunk_type='figure' + image_path and are NOT re-split.
-    Text chunks get chunk_type='text' and pass through the RecursiveCharacterTextSplitter.
+    Convert a parsed DoclingDocument into a list of LangChain Document chunks.
+
+    Two types of chunks are produced:
+    - Text chunks (chunk_type='text'): passed through the text splitter
+    - Figure chunks (chunk_type='figure'): kept whole, with image_path in metadata.
+      Each figure chunk gets a German vision description generated by the LLM so
+      it becomes searchable by text queries.
+
+    Any figure that Docling's HybridChunker produced no surrounding text for
+    gets a stub placeholder so it still appears in the vector store.
     """
     chunker = HybridChunker()
     text_docs: list[Document]   = []
@@ -195,6 +238,7 @@ def _build_chunks(
         if not text.strip():
             continue
 
+        # Check if any item in this chunk is a figure/chart
         image_path: str | None = None
         for doc_item in raw_chunk.meta.doc_items:
             if doc_item.label in _VISUAL_LABELS:
@@ -213,13 +257,15 @@ def _build_chunks(
                 metadata={"source": source_name, "chunk_type": "text"},
             ))
 
-    # Stub chunks for any PictureItem HybridChunker produced no text for
+    # Find which figure refs the chunker already covered
     chunked_refs = {
         doc_item.self_ref
         for raw_chunk in chunker.chunk(dl_doc)
         for doc_item in raw_chunk.meta.doc_items
         if doc_item.label in _VISUAL_LABELS
     }
+
+    # Add stub chunks for figures the chunker produced no text context for
     for ref, img_path in ref_to_path.items():
         if ref not in chunked_refs:
             figure_docs.append(Document(
@@ -227,7 +273,7 @@ def _build_chunks(
                 metadata={"source": source_name, "chunk_type": "figure", "image_path": img_path},
             ))
 
-    # Generate vision descriptions for all figure chunks so they are retrievable
+    # Generate a German vision description for each figure so it's retrievable by text search
     for doc in figure_docs:
         img_path = doc.metadata.get("image_path", "")
         if not img_path:
@@ -238,6 +284,7 @@ def _build_chunks(
             doc.page_content = description
             doc.metadata["image_description"] = description
 
+    # Split long text chunks into smaller pieces
     split_text = _splitter.split_documents(text_docs)
     for c in split_text:
         c.metadata.setdefault("chunk_type", "text")
@@ -246,7 +293,10 @@ def _build_chunks(
 
 
 def _extract_docx_links(file_path: str, source_name: str) -> list[Document]:
-    """Return a Document chunk listing all hyperlinks found in a DOCX file."""
+    """
+    Extract all hyperlinks from a DOCX file and return them as a single text chunk.
+    This ensures links buried in Word documents remain retrievable via the RAG search.
+    """
     from docx import Document as DocxDocument
     from docx.oxml.ns import qn
 
@@ -259,7 +309,7 @@ def _extract_docx_links(file_path: str, source_name: str) -> list[Document]:
                 if r_id and r_id in doc.part.rels:
                     rel = doc.part.rels[r_id]
                     if "hyperlink" in rel.reltype:
-                        url = rel.target_ref
+                        url  = rel.target_ref
                         text = "".join(t.text for t in hyperlink.iter(qn("w:t"))).strip()
                         if url:
                             links.append((text, url))
@@ -281,7 +331,11 @@ def _extract_docx_links(file_path: str, source_name: str) -> list[Document]:
 # ── Vision helpers ─────────────────────────────────────────────────────────────
 
 def _image_to_b64(image_path: str) -> str | None:
-    """Load an image, resize to VISION_TOKEN_BUDGET, return base64 PNG string."""
+    """
+    Load an image from disk, resize it to fit within the configured token budget,
+    and return it as a base64-encoded PNG string ready to send to the vision model.
+    Returns None if the image can't be loaded.
+    """
     try:
         img = PILImage.open(image_path).convert("RGB")
         max_pixels = config.VISION_TOKEN_BUDGET * 512
@@ -298,17 +352,27 @@ def _image_to_b64(image_path: str) -> str | None:
 
 
 def _describe_image(image_path: str, surrounding_text: str = "") -> str:
-    """Call Gemma vision to generate a German description of an image for retrieval."""
+    """
+    Send an image to the LLM (vision mode) and get back a German description
+    suitable for indexing. The surrounding document text is included as context
+    so the model can produce a more relevant description.
+    Returns an empty string on failure.
+    """
     b64 = _image_to_b64(image_path)
     if not b64:
         return ""
-    ctx = f"\n\nUmliegender Textkontext aus dem Dokument:\n{surrounding_text[:800]}" if surrounding_text.strip() else ""
+
+    ctx = (
+        f"\n\nUmliegender Textkontext aus dem Dokument:\n{surrounding_text[:800]}"
+        if surrounding_text.strip() else ""
+    )
     prompt = (
         "Beschreibe dieses Bild auf Deutsch ausführlich für ein technisches Dokumentensystem. "
         "Nenne: Art der Visualisierung, alle sichtbaren Zahlen und Bezeichnungen, "
         "den wesentlichen Inhalt und welche Schlussfolgerung es vermittelt."
         + ctx
     )
+
     try:
         response = llm.invoke([HumanMessage(content=[
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
@@ -320,15 +384,19 @@ def _describe_image(image_path: str, surrounding_text: str = "") -> str:
         return ""
 
 
-# ── RAG pipeline ──────────────────────────────────────────────────────────────
+# ── RAG pipeline setup ────────────────────────────────────────────────────────
+# These objects are created once at startup and reused for every request.
 
+# Embedding model: converts text to dense vectors for semantic search
 _embeddings = HuggingFaceEmbeddings(
     model_name="BAAI/bge-m3",
     model_kwargs={"device": config.EMBED_DEVICE},
 )
 
+# Qdrant vector store client (local file-based, no separate server needed)
 _qdrant_client = QdrantClient(path=config.QDRANT_PATH)
 
+# Vector store: combines dense embeddings + sparse BM25 for hybrid search
 vectorstore = QdrantVectorStore(
     client=_qdrant_client,
     collection_name=config.COLLECTION,
@@ -337,6 +405,7 @@ vectorstore = QdrantVectorStore(
     retrieval_mode=RetrievalMode.HYBRID,
 )
 
+# The local LLM served via Ollama
 llm = ChatOllama(
     base_url=config.OLLAMA_BASE_URL,
     model=config.LLM_MODEL,
@@ -344,8 +413,11 @@ llm = ChatOllama(
     num_ctx=config.LLM_NUM_CTX,
 )
 
+# Basic retriever: fetches the top-K most relevant chunks for a query
 base_retriever = vectorstore.as_retriever(search_kwargs={"k": config.TOP_K})
 
+# Query expansion chain: the LLM rewrites a user question into 3 alternative
+# phrasings (2 in the same language, 1 translated) to improve retrieval recall
 _expand_chain = (
     ChatPromptTemplate.from_template(
         "You are a multilingual query expansion assistant for a bilingual (German/English) document corpus.\n"
@@ -364,7 +436,10 @@ _expand_chain = (
 
 
 def _parse_expand_alternatives(raw: str) -> list[str]:
-    """Extract JSON array of alternative queries from LLM output."""
+    """
+    Parse the JSON array of alternative queries from the LLM's raw output.
+    Falls back to treating each non-empty line as an alternative if JSON parsing fails.
+    """
     start = raw.find("[")
     end   = raw.rfind("]")
     if start == -1 or end == -1:
@@ -373,9 +448,11 @@ def _parse_expand_alternatives(raw: str) -> list[str]:
         items = json.loads(raw[start:end + 1])
         return [s.strip() for s in items if isinstance(s, str) and s.strip()]
     except Exception:
-        # Fallback: treat each non-empty line as an alternative
         return [ln.strip() for ln in raw.splitlines() if ln.strip()]
 
+
+# Follow-up suggestion chain: after answering, the LLM generates 3 questions
+# the user might want to ask next, based on the retrieved context and the answer
 _suggest_chain = (
     ChatPromptTemplate.from_template(
         "You are a DRÄXLMAIER sales onboarding assistant.\n"
@@ -394,7 +471,7 @@ _suggest_chain = (
 
 
 def _parse_suggestions(raw: str) -> list[str]:
-    """Extract JSON array of strings from LLM output, tolerating surrounding text."""
+    """Parse the JSON array of follow-up suggestions from the LLM's raw output."""
     start = raw.find("[")
     end   = raw.rfind("]")
     if start == -1 or end == -1:
@@ -405,29 +482,35 @@ def _parse_suggestions(raw: str) -> list[str]:
     except Exception:
         return []
 
-def multi_retrieve(question: str) -> tuple[list, list]:
-    """Return (text_docs, figure_docs).
 
-    Text docs: retrieved by hybrid search — these are the ground-truth sources.
-    Figure docs: fetched from Qdrant by source name match — images from the
-    same documents that were cited, NOT ranked by query similarity. This means
-    images appear because their document was relevant, not because the image
-    description happened to score well.
+def multi_retrieve(question: str) -> tuple[list, list]:
     """
-    raw_expand  = _expand_chain.invoke({"question": question})
-    alternatives = _parse_expand_alternatives(raw_expand)          # 3 items: 2 same-lang + 1 cross-lang
-    queries = [question] + alternatives                             # 4 queries total
+    Retrieve relevant document chunks for a user question using multi-query expansion.
+
+    Steps:
+    1. The LLM expands the question into 3 alternative phrasings
+    2. All 4 queries (original + 3 alternatives) run against the vector store
+    3. Text chunks are deduplicated and returned as the ground-truth sources
+    4. Figure chunks are retrieved separately with a relevance score gate —
+       only images that genuinely match the query above _MIN_FIGURE_SCORE are included
+
+    Returns (text_docs, figure_docs).
+    """
+    raw_expand   = _expand_chain.invoke({"question": question})
+    alternatives = _parse_expand_alternatives(raw_expand)
+    queries      = [question] + alternatives   # 4 queries total
+
+    # Collect unique text chunks across all query variants
     seen, text_docs = set(), []
     for q in queries:
         for doc in base_retriever.invoke(q):
             if doc.metadata.get("chunk_type") == "figure":
-                continue  # never retrieve figures by query score
+                continue  # figures are retrieved separately below
             if doc.page_content not in seen:
                 seen.add(doc.page_content)
                 text_docs.append(doc)
 
-    # Score-gated figure retrieval — only images that genuinely match the query
-    # clear the threshold; everything else is silently dropped.
+    # Retrieve figure chunks with a score threshold — silently skip if Qdrant filter fails
     figure_docs: list = []
     try:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -455,17 +538,21 @@ def multi_retrieve(question: str) -> tuple[list, list]:
 
 
 def format_docs(docs: list) -> str:
-    """Context string for Gemma — text chunks only, no image descriptions."""
+    """Format text chunks into a numbered context string to pass to the LLM."""
     return "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs))
 
 
-_PIPE_BEFORE_CITE = re.compile(r'\s*\|\s*(?=\[\d)')
-_JAMMED_CITES = re.compile(r'\](\[\d+\])')
-_LONE_CITE_PERIOD = re.compile(r'((?:\[\d+\]\s*)+)\.\s*$', re.MULTILINE)
+# ── Response formatting ────────────────────────────────────────────────────────
+# Gemma sometimes produces malformed output when combining bullet lists with citations.
+# These patterns fix the most common issues before streaming to the frontend.
+
+_PIPE_BEFORE_CITE  = re.compile(r'\s*\|\s*(?=\[\d)')        # "text | [1]" → "text [1]"
+_JAMMED_CITES      = re.compile(r'\](\[\d+\])')              # "][2]" → "] [2]"
+_LONE_CITE_PERIOD  = re.compile(r'((?:\[\d+\]\s*)+)\.\s*$', re.MULTILINE)  # "[1]." → "[1]"
 
 
 def repair_gemma_formatting(text: str) -> str:
-    """Fix Gemma's broken bullet+pipe pattern before streaming to the frontend."""
+    """Fix Gemma's broken bullet+pipe citation patterns before streaming to the frontend."""
     lines = text.split('\n')
     result: list[str] = []
     in_fence = False
@@ -482,6 +569,10 @@ def repair_gemma_formatting(text: str) -> str:
     text = _LONE_CITE_PERIOD.sub(lambda m: m.group(1).rstrip(), text)
     return text
 
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+# Defines DRÄXIE's persona, grounding rules, citation format, and language behaviour.
+# This is sent as the system message on every chat request.
 
 _SYSTEM_PROMPT = """\
 You are DRÄXIE, a precise onboarding assistant for DRÄXLMAIER sales staff.
@@ -574,12 +665,14 @@ CONVERSATION
 - Use earlier messages in the conversation for context when relevant.
 """
 
+# The answer prompt: system instructions + conversation history + current question with context
 _answer_prompt = ChatPromptTemplate.from_messages([
     ("system", _SYSTEM_PROMPT),
     MessagesPlaceholder(variable_name="history"),
     ("human", "Unterlagen:\n{context}\n\nANWEISUNG: Beantworte ausschließlich auf Basis der Unterlagen oben. Wenn das Thema der Frage dort nicht vorkommt, antworte NUR mit: \"Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden.\" Kein Allgemeinwissen, keine eigene Recherche.\n\nFrage: {question}"),
 ])
 
+# LangChain chain that automatically loads and saves conversation history from SQLite
 _chain_with_history = RunnableWithMessageHistory(
     _answer_prompt | llm | StrOutputParser(),
     get_session_history,
@@ -587,10 +680,81 @@ _chain_with_history = RunnableWithMessageHistory(
     history_messages_key="history",
 )
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
+
+# ── No-answer detection ────────────────────────────────────────────────────────
+# The LLM sometimes paraphrases "I don't know" in different ways.
+# These helpers normalise any such response to a single canonical sentence.
+
+_NO_ANSWER_DE = "Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden."
+_NO_ANSWER_EN = "I couldn't find anything on that in the available documents."
+
+# Lowercase trigger phrases that indicate the LLM couldn't find an answer
+_NO_ANSWER_TRIGGERS = [
+    "keine informationen", "nicht gefunden", "nicht in den unterlagen",
+    "nicht in den bereitgestellten", "nicht in meinen", "leider nichts",
+    "keine angaben", "nicht enthalten", "nicht verfügbar", "nicht vorhanden",
+    "i couldn't find", "no information", "not found in", "cannot find",
+    "not available in", "not mentioned in", "no relevant", "nothing found",
+    "keine relevanten", "nicht erwähnt", "nicht behandelt",
+]
+
+# Common English function words used to detect the question language
+_EN_MARKERS = {"what", "who", "where", "when", "why", "how", "is", "are",
+               "was", "were", "does", "did", "can", "could", "would", "tell",
+               "explain", "describe", "give", "show", "list", "find", "the", "a"}
+
+
+def _detect_language(text: str) -> str:
+    """
+    Heuristically detect whether a text is English or German.
+    Counts word overlap with known English and German marker sets.
+    Returns 'en' or 'de'.
+    """
+    words   = set(re.findall(r"[a-zA-ZäöüÄÖÜß]+", text.lower()))
+    en_hits = len(words & _EN_MARKERS)
+    de_hits = len(words & {"wie", "welche", "welcher", "welches", "warum",
+                            "wann", "können", "gibt", "sind", "haben", "bitte",
+                            "erkläre", "zeige", "nenne", "beschreibe"})
+    return "en" if en_hits > de_hits else "de"
+
+
+def _normalize_no_answer(text: str, question: str) -> str:
+    """
+    Replace any LLM paraphrase of "I don't know" with the canonical no-answer sentence.
+    If the response already contains citation markers like [1] or [2], it found real
+    content and is left untouched.
+    """
+    if re.search(r'\[\d+\]', text):
+        return text  # real answer with citations — don't touch
+    lower = text.lower()
+    if any(t in lower for t in _NO_ANSWER_TRIGGERS):
+        return _NO_ANSWER_EN if _detect_language(question) == "en" else _NO_ANSWER_DE
+    return text
+
+
+def _best_text_score(question: str) -> float:
+    """
+    Check the relevance score of the single best-matching text chunk for a question.
+    Used as a fast off-topic gate before calling the LLM — if nothing in the vector
+    store is close enough to the question, we skip the LLM entirely.
+    Fails open (returns 1.0) if Qdrant can't be reached, so the LLM still runs.
+    """
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        results = vectorstore.similarity_search_with_relevance_scores(
+            question, k=1,
+            filter=Filter(must=[FieldCondition(key="metadata.chunk_type", match=MatchValue(value="text"))])
+        )
+        return results[0][1] if results else 0.0
+    except Exception:
+        return 1.0
+
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="DRÄXIE API")
 
+# Allow all origins so the frontend can talk to the backend during local development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -598,9 +762,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve the built React frontend's static assets
 app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
 
-# Serve extracted images
+# Serve extracted document images (referenced by image_url in chunk metadata)
 _images_dir = Path(config.IMAGE_STORE_PATH)
 _images_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(_images_dir)), name="images")
@@ -611,94 +776,47 @@ _uploads_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(_uploads_dir)), name="uploads")
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Request/response models ───────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    question: str
+    question:        str
     conversation_id: str
 
 
 class FeedbackRequest(BaseModel):
     conversation_id: str
-    rating: str          # "up" or "down"
-    question: str
-    answer: str
+    rating:          str   # "up" or "down"
+    question:        str
+    answer:          str
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
+    """Serve the React SPA entry point."""
     return FileResponse("frontend/dist/index.html")
 
 
 @app.get("/draexie-mascot.js")
 async def mascot_js():
+    """Serve the animated mascot JavaScript bundle."""
     return FileResponse("frontend/dist/draexie-mascot.js", media_type="application/javascript")
-
-
-_NO_ANSWER_DE = "Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden."
-_NO_ANSWER_EN = "I couldn't find anything on that in the available documents."
-
-# Phrases the LLM produces when it can't find an answer (instead of our canonical text).
-_NO_ANSWER_TRIGGERS = [
-    "keine informationen", "nicht gefunden", "nicht in den unterlagen",
-    "nicht in den bereitgestellten", "nicht in meinen", "leider nichts",
-    "keine angaben", "nicht enthalten", "nicht verfügbar", "nicht vorhanden",
-    "i couldn't find", "no information", "not found in", "cannot find",
-    "not available in", "not mentioned in", "no relevant", "nothing found",
-    "keine relevanten", "nicht erwähnt", "nicht behandelt",
-]
-
-
-_EN_MARKERS = {"what", "who", "where", "when", "why", "how", "is", "are",
-               "was", "were", "does", "did", "can", "could", "would", "tell",
-               "explain", "describe", "give", "show", "list", "find", "the", "a"}
-
-
-def _detect_language(text: str) -> str:
-    """Return 'en' if the text is predominantly English, otherwise 'de'."""
-    words = set(re.findall(r"[a-zA-ZäöüÄÖÜß]+", text.lower()))
-    en_hits = len(words & _EN_MARKERS)
-    # Common unambiguous German words that don't appear in English
-    de_hits = len(words & {"wie", "welche", "welcher", "welches", "warum",
-                            "wann", "können", "gibt", "sind", "haben", "bitte",
-                            "erkläre", "zeige", "nenne", "beschreibe"})
-    return "en" if en_hits > de_hits else "de"
-
-
-def _normalize_no_answer(text: str, question: str) -> str:
-    """Replace LLM no-answer paraphrases with our canonical sentence.
-
-    If the response contains citation markers ([1], [2] …) it found relevant
-    content — leave it untouched.  Otherwise, if it matches any known
-    no-answer phrasing, replace with the correct DE or EN canonical string.
-    """
-    if re.search(r'\[\d+\]', text):
-        return text  # has citations → real answer, don't touch
-    lower = text.lower()
-    if any(t in lower for t in _NO_ANSWER_TRIGGERS):
-        return _NO_ANSWER_EN if _detect_language(question) == "en" else _NO_ANSWER_DE
-    return text
-
-
-def _best_text_score(question: str) -> float:
-    """Return the highest relevance score any text chunk scores against the question.
-    Used as a fast off-topic gate — avoids calling the LLM for irrelevant queries."""
-    try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        results = vectorstore.similarity_search_with_relevance_scores(
-            question, k=1,
-            filter=Filter(must=[FieldCondition(key="metadata.chunk_type", match=MatchValue(value="text"))])
-        )
-        return results[0][1] if results else 0.0
-    except Exception:
-        return 1.0  # fail open — let the LLM handle it
 
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    # Off-topic gate: if no text chunk scores above the threshold, skip the LLM entirely.
+    """
+    Main chat endpoint. Returns a Server-Sent Events stream with three event types:
+    1. sources/chunks  — which documents and excerpts were retrieved
+    2. token           — the full generated answer (sent as one piece after generation)
+    3. done            — signals completion, includes follow-up suggestions
+
+    Two code paths depending on whether relevant figures were found:
+    - Multimodal path: images are base64-encoded and sent to the LLM alongside the text context
+    - Text-only path:  standard LangChain chain with conversation history
+    """
+    # Off-topic gate: skip the LLM entirely if nothing relevant is in the vector store
     best_score = _best_text_score(req.question)
     if best_score < _MIN_TEXT_RELEVANCE:
         no_ans = _NO_ANSWER_EN if _detect_language(req.question) == "en" else _NO_ANSWER_DE
@@ -708,20 +826,21 @@ def chat(req: ChatRequest):
             yield f"data: {json.dumps({'done': True, 'suggestions': []})}\n\n"
         return StreamingResponse(_nope(), media_type="text/event-stream")
 
+    # Retrieve relevant text and figure chunks
     text_docs, figure_docs = multi_retrieve(req.question)
 
-    # Sources: unique filenames from text docs only (ground truth)
+    # Source filenames (deduplicated, text docs only — these are shown to the user)
     sources = list(dict.fromkeys(
         Path(d.metadata.get("source", "unknown")).name for d in text_docs
     ))
 
-    # Chunks: text chunks numbered [1..N], figure chunks appended after (no number in context)
+    # Chunk objects sent to the frontend for the "sources" panel
     all_docs = text_docs + figure_docs
     chunks = [
         {
-            "num": i + 1,
-            "source": Path(d.metadata.get("source", "unknown")).name,
-            "text": d.page_content[:500] if d.metadata.get("chunk_type") != "figure" else "",
+            "num":       i + 1,
+            "source":    Path(d.metadata.get("source", "unknown")).name,
+            "text":      d.page_content[:500] if d.metadata.get("chunk_type") != "figure" else "",
             "image_url": (
                 f"/images/{Path(d.metadata['image_path']).name}"
                 if d.metadata.get("chunk_type") == "figure"
@@ -733,12 +852,12 @@ def chat(req: ChatRequest):
         for i, d in enumerate(all_docs)
     ]
 
-    # Context for Gemma: text chunks only — figure descriptions never sent to LLM
+    # Text context sent to the LLM (figures are never included here — only their descriptions were indexed)
     context = format_docs(text_docs)
 
-    # Image paths for multimodal path (from cited source documents)
+    # Collect unique image file paths for the multimodal path
     image_paths: list[str] = []
-    seen_paths: set[str] = set()
+    seen_paths:  set[str]  = set()
     for d in figure_docs:
         p = d.metadata.get("image_path", "")
         if p and p not in seen_paths and Path(p).exists():
@@ -746,23 +865,29 @@ def chat(req: ChatRequest):
             seen_paths.add(p)
 
     def generate():
+        # Always send sources first so the frontend can display them immediately
         yield f"data: {json.dumps({'sources': sources, 'chunks': chunks})}\n\n"
 
         if image_paths:
-            # ── Multimodal path ───────────────────────────────────────────────
-            # Build base64 payloads (resized to VISION_TOKEN_BUDGET)
+            # ── Multimodal path: question + images sent directly to the LLM ──
             b64_images = [b for p in image_paths if (b := _image_to_b64(p)) is not None]
 
+            # Load conversation history, capped at last 10 messages to stay within context window
             history_obj  = get_session_history(req.conversation_id)
-            # Keep only the last 10 messages (5 turns) so old history never blows the context window
             history_msgs = history_obj.messages[-10:]
 
-            # Gemma 4: images before text for optimal multimodal attention
+            # Build the multimodal message: images first, then text (optimal for Gemma)
             human_content: list[dict] = [
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}}
                 for b in b64_images
             ] + [
-                {"type": "text", "text": f"Kontext:\n{context}\n\nANWEISUNG: Beantworte ausschließlich auf Basis der Unterlagen oben. Wenn das Thema der Frage dort nicht vorkommt, antworte NUR mit: \"Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden.\" Kein Allgemeinwissen, keine eigene Recherche.\n\nFrage: {req.question}"},
+                {"type": "text", "text": (
+                    f"Kontext:\n{context}\n\n"
+                    "ANWEISUNG: Beantworte ausschließlich auf Basis der Unterlagen oben. "
+                    "Wenn das Thema der Frage dort nicht vorkommt, antworte NUR mit: "
+                    "\"Dazu habe ich in den verfügbaren Unterlagen leider nichts gefunden.\" "
+                    f"Kein Allgemeinwissen, keine eigene Recherche.\n\nFrage: {req.question}"
+                )},
             ]
 
             messages = [
@@ -771,37 +896,41 @@ def chat(req: ChatRequest):
                 HumanMessage(content=human_content),
             ]
 
+            # Stream the response, collect the full answer, then send it as one token event
             full_answer = ""
             for chunk in llm.stream(messages):
                 tok = chunk.content if hasattr(chunk, "content") else str(chunk)
                 if tok:
                     full_answer += tok
+
             full_answer = _normalize_no_answer(repair_gemma_formatting(full_answer), req.question)
             yield f"data: {json.dumps({'token': full_answer})}\n\n"
 
-            # Persist turn to conversation history manually
+            # Manually persist the turn since we bypassed LangChain's history chain
             history_obj.add_user_message(req.question)
             history_obj.add_ai_message(full_answer)
-            ai_msg_idx = len(history_obj.messages) - 1
-            _save_message_sources(req.conversation_id, ai_msg_idx, sources, chunks)
+            _save_message_sources(req.conversation_id, len(history_obj.messages) - 1, sources, chunks)
 
         else:
-            # ── Text-only path ────────────────────────────────────────────────
+            # ── Text-only path: standard LangChain chain with automatic history ──
             full_answer = ""
             for token in _chain_with_history.stream(
                 {"context": context, "question": req.question},
                 config={"configurable": {"session_id": req.conversation_id}},
             ):
                 full_answer += token
+
             full_answer = _normalize_no_answer(repair_gemma_formatting(full_answer), req.question)
             yield f"data: {json.dumps({'token': full_answer})}\n\n"
+
+            # Save which sources were used for this message
             history_after = get_session_history(req.conversation_id)
             _save_message_sources(req.conversation_id, len(history_after.messages) - 1, sources, chunks)
 
-        # ── Suggested follow-up questions (generated before done) ────────────
+        # Generate follow-up question suggestions based on the answer and context
         suggestions: list[str] = []
         try:
-            raw = _suggest_chain.invoke({"context": context, "answer": full_answer})
+            raw         = _suggest_chain.invoke({"context": context, "answer": full_answer})
             suggestions = _parse_suggestions(raw)
         except Exception:
             pass
@@ -811,10 +940,11 @@ def chat(req: ChatRequest):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-# ── Conversations ─────────────────────────────────────────────────────────────
+# ── Conversation history routes ───────────────────────────────────────────────
 
 @app.get("/conversations")
 def list_conversations():
+    """Return all conversations, sorted newest first, with title and message count."""
     db_path = Path("conversations.db")
     if not db_path.exists():
         return []
@@ -836,6 +966,7 @@ def list_conversations():
         if stored_title:
             title = stored_title
         else:
+            # Fall back to the first user message as the title
             history = get_session_history(session_id)
             msgs = history.messages
             if not msgs:
@@ -845,9 +976,9 @@ def list_conversations():
                 "Unbenanntes Gespräch",
             )
         result.append({
-            "id": session_id,
-            "title": title,
-            "created_at": str(last_id),
+            "id":            session_id,
+            "title":         title,
+            "created_at":    str(last_id),
             "message_count": cnt,
         })
     return result
@@ -855,7 +986,11 @@ def list_conversations():
 
 @app.post("/conversations/{conversation_id}/title")
 def generate_title(conversation_id: str):
-    history = get_session_history(conversation_id)
+    """
+    Ask the LLM to generate a short German title for a conversation based on
+    its first user message, then persist it in conversation_titles.
+    """
+    history     = get_session_history(conversation_id)
     first_human = next(
         (m.content for m in history.messages if isinstance(m, HumanMessage)),
         None,
@@ -864,7 +999,7 @@ def generate_title(conversation_id: str):
         return {"title": "Unbenanntes Gespräch"}
 
     try:
-        resp = llm.invoke([HumanMessage(content=(
+        resp  = llm.invoke([HumanMessage(content=(
             f"Erstelle einen kurzen deutschen Titel (maximal 6 Wörter, keine Anführungszeichen) "
             f"für ein Gespräch, das mit dieser Frage beginnt:\n\n{first_human[:300]}"
         ))])
@@ -885,17 +1020,24 @@ def generate_title(conversation_id: str):
 
 @app.get("/conversations/search")
 def search_conversations(q: str):
+    """
+    Full-text search across conversations. Searches three places:
+    1. Message content
+    2. Conversation titles
+    3. Source document filenames cited in answers
+    Returns one result per matching conversation with a short excerpt.
+    """
     db_path = Path("conversations.db")
     if not db_path.exists() or not q.strip():
         return []
 
-    con = sqlite3.connect(db_path)
+    con    = sqlite3.connect(db_path)
     _ensure_conv_tables(con)
     like_q = f"%{q}%"
-    seen: dict[str, dict] = {}
+    seen:   dict[str, dict] = {}
 
     def _msg_text(raw: str) -> str:
-        """Extract plain text from LangChain's JSON message format."""
+        """Extract plain text from LangChain's JSON message storage format."""
         try:
             return json.loads(raw).get("data", {}).get("content", raw)
         except Exception:
@@ -905,11 +1047,12 @@ def search_conversations(q: str):
         session_id: str, text: str, stored_title: str | None,
         msg_idx: int, created_at: str | None = None,
     ) -> dict | None:
+        """Build a search result entry with a highlighted excerpt around the match."""
         idx = text.lower().find(q.lower())
         if idx == -1:
             return None
-        start = max(0, idx - 55)
-        end   = min(len(text), idx + len(q) + 55)
+        start   = max(0, idx - 55)
+        end     = min(len(text), idx + len(q) + 55)
         excerpt = ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
         return {
             "id":          session_id,
@@ -921,7 +1064,7 @@ def search_conversations(q: str):
             "created_at":  created_at,
         }
 
-    # 1. Message content (column is 'message', stores JSON)
+    # 1. Search message content
     for session_id, raw_msg, stored_title, msg_idx, created_at in con.execute("""
         SELECT m.session_id, m.message, t.title,
                (SELECT COUNT(*) FROM message_store m2
@@ -937,7 +1080,7 @@ def search_conversations(q: str):
             if entry:
                 seen[session_id] = entry
 
-    # 2. Conversation titles
+    # 2. Search conversation titles
     for session_id, title, created_at in con.execute(
         "SELECT conversation_id, title, created_at FROM conversation_titles WHERE title LIKE ?", (like_q,)
     ).fetchall():
@@ -946,7 +1089,7 @@ def search_conversations(q: str):
             if entry:
                 seen[session_id] = entry
 
-    # 3. Source document names
+    # 3. Search source document names used in answers
     for session_id, sources_json, msg_idx, stored_title, created_at in con.execute("""
         SELECT ms.conversation_id, ms.sources, ms.msg_index, t.title, t.created_at
         FROM message_sources ms
@@ -975,8 +1118,13 @@ def search_conversations(q: str):
 
 @app.get("/conversations/{conversation_id}")
 def get_conversation(conversation_id: str):
+    """
+    Return the full message history for a conversation, with sources and chunk
+    metadata attached to each assistant message.
+    """
     history = get_session_history(conversation_id)
 
+    # Load which sources were cited for each assistant message
     sources_map: dict[int, dict] = {}
     db_path = Path("conversations.db")
     if db_path.exists():
@@ -992,7 +1140,7 @@ def get_conversation(conversation_id: str):
                     "chunks":  json.loads(chk_json) if chk_json else [],
                 }
         except sqlite3.OperationalError:
-            pass  # table doesn't exist yet (old DB)
+            pass  # table doesn't exist yet in older databases
         finally:
             con.close()
 
@@ -1012,6 +1160,7 @@ def get_conversation(conversation_id: str):
 
 @app.delete("/conversations/{conversation_id}")
 def delete_conversation(conversation_id: str):
+    """Delete all messages for a conversation from the history store."""
     get_session_history(conversation_id).clear()
     return {"deleted": conversation_id}
 
@@ -1020,6 +1169,7 @@ def delete_conversation(conversation_id: str):
 
 @app.post("/feedback")
 def feedback(req: FeedbackRequest):
+    """Store a thumbs-up or thumbs-down rating for an answer in the metadata DB."""
     con = sqlite3.connect(META_DB)
     con.execute(
         "INSERT INTO feedback (conversation_id, rating, question, answer) VALUES (?,?,?,?)",
@@ -1036,7 +1186,12 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md", ".png"
 
 
 def _ingest_file(tmp_path: str, original_name: str) -> None:
-    # Keep a copy so the document viewer can serve the original file
+    """
+    Background task: parse an uploaded file, embed it, and add it to the vector store.
+    Also saves a copy of the original file so the document viewer can serve it.
+    Logs the result (success or error) to the ingestion_log table.
+    """
+    # Keep original file accessible for the in-app document viewer
     upload_copy = _uploads_dir / original_name
     upload_copy.write_bytes(Path(tmp_path).read_bytes())
 
@@ -1061,7 +1216,7 @@ def _ingest_file(tmp_path: str, original_name: str) -> None:
     finally:
         con.commit()
         con.close()
-        os.unlink(tmp_path)
+        os.unlink(tmp_path)   # clean up the temp file regardless of success/failure
 
 
 @app.post("/documents")
@@ -1069,6 +1224,10 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
+    """
+    Accept a document upload, save it to a temp file, and kick off background ingestion.
+    Returns immediately — the client can poll /documents/status to track progress.
+    """
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         return {"error": f"Unsupported file type: {suffix}"}
@@ -1083,7 +1242,8 @@ async def upload_document(
 
 @app.get("/documents/status")
 def ingestion_status():
-    con = sqlite3.connect(META_DB)
+    """Return the 20 most recent ingestion log entries (newest first)."""
+    con  = sqlite3.connect(META_DB)
     rows = con.execute(
         "SELECT filename, chunks, status, error, created_at FROM ingestion_log ORDER BY id DESC LIMIT 20"
     ).fetchall()
@@ -1094,117 +1254,33 @@ def ingestion_status():
     ]
 
 
-# ── Admin ────────────────────────────────────────────────────────────────────
-
-import hashlib as _hashlib
-import imagehash as _imagehash
-
-_rebuild_status: dict = {"running": False, "processed": 0, "updated": 0, "total": 0, "skipped_duplicate": 0, "skipped_already_done": 0}
-
-
-def _rebuild_all_figures() -> None:
-    from qdrant_client.models import PointIdsList
-
-    _rebuild_status.update(running=True, processed=0, updated=0, total=0, skipped_duplicate=0, skipped_already_done=0)
-
-    # First pass: collect all figure points
-    figure_points = []
-    offset = None
-    while True:
-        points, next_offset = _qdrant_client.scroll(
-            collection_name=config.COLLECTION,
-            scroll_filter=None,
-            limit=100,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for point in points:
-            payload = point.payload or {}
-            meta = payload.get("metadata", {})
-            if meta.get("chunk_type") != "figure":
-                continue
-            img_path = meta.get("image_path", "")
-            if not img_path or not Path(img_path).exists():
-                continue
-            existing = meta.get("image_description", "")
-            if existing and len(existing) >= 80:
-                _rebuild_status["skipped_already_done"] += 1
-                continue
-            figure_points.append((point.id, payload, img_path))
-        if next_offset is None:
-            break
-        offset = next_offset
-
-    _rebuild_status["total"] = len(figure_points)
-
-    # Second pass: describe each image, deduplicating by file hash
-    hash_to_description: dict[str, str] = {}
-    for point_id, payload, img_path in figure_points:
-        _rebuild_status["processed"] += 1
-
-        # Hash the image file to detect duplicates
-        try:
-            img_hash = str(_imagehash.phash(PILImage.open(img_path)))
-        except OSError:
-            continue
-
-        if img_hash in hash_to_description:
-            description = hash_to_description[img_hash]
-            _rebuild_status["skipped_duplicate"] += 1
-        else:
-            description = _describe_image(img_path)
-            if not description:
-                continue
-            hash_to_description[img_hash] = description
-
-        # Delete old point, re-add via LangChain so both dense+sparse vectors are generated
-        _qdrant_client.delete(
-            collection_name=config.COLLECTION,
-            points_selector=PointIdsList(points=[point_id]),
-        )
-        new_meta = {**payload.get("metadata", {}), "image_description": description}
-        vectorstore.add_documents([Document(page_content=description, metadata=new_meta)])
-        _rebuild_status["updated"] += 1
-
-    _rebuild_status["running"] = False
-
-
-@app.post("/admin/rebuild-image-descriptions")
-def rebuild_image_descriptions(background_tasks: BackgroundTasks):
-    """Rebuild vision descriptions for ALL figure chunks. Deduplicates by image hash."""
-    if _rebuild_status["running"]:
-        return {"error": "Already running", "status": _rebuild_status}
-    background_tasks.add_task(_rebuild_all_figures)
-    return {"status": "started"}
-
-
-@app.get("/admin/rebuild-status")
-def rebuild_status():
-    return _rebuild_status
-
-
-# ── Health ────────────────────────────────────────────────────────────────────
+# ── Health check ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    # Qdrant
+    """
+    Returns the operational status of all three system components:
+    - Qdrant: checks the collection exists and reports chunk count
+    - Ollama: pings the local model server
+    - Last ingestion: reports the most recently successfully indexed file
+    """
+    # Check Qdrant
     try:
-        count = _qdrant_client.count(config.COLLECTION).count
+        count    = _qdrant_client.count(config.COLLECTION).count
         qdrant_ok = True
     except Exception:
-        count = 0
+        count    = 0
         qdrant_ok = False
 
-    # Ollama
+    # Check Ollama
     try:
-        r = httpx.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=3.0)
+        r        = httpx.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=3.0)
         ollama_ok = r.status_code == 200
     except Exception:
         ollama_ok = False
 
-    # Last ingestion
-    con = sqlite3.connect(META_DB)
+    # Fetch last successful ingestion from the log
+    con  = sqlite3.connect(META_DB)
     last = con.execute(
         "SELECT filename, created_at FROM ingestion_log WHERE status='ok' ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -1212,13 +1288,18 @@ def health():
 
     return {
         "status": "ok" if (qdrant_ok and ollama_ok) else "degraded",
-        "qdrant":  {"ok": qdrant_ok, "chunks": count, "collection": config.COLLECTION},
-        "ollama":  {"ok": ollama_ok, "model": config.LLM_MODEL},
+        "qdrant": {"ok": qdrant_ok, "chunks": count, "collection": config.COLLECTION},
+        "ollama": {"ok": ollama_ok, "model": config.LLM_MODEL},
         "last_ingestion": {"filename": last[0], "at": last[1]} if last else None,
     }
 
 
+# ── SPA fallback ──────────────────────────────────────────────────────────────
+
 @app.get("/{full_path:path}", include_in_schema=False)
 async def spa_fallback(full_path: str):
-    """Serve React SPA for all non-API routes."""
+    """
+    Catch-all route: serve the React SPA for any URL that isn't an API endpoint.
+    This allows client-side routing (e.g. /chat/123) to work when the page is refreshed.
+    """
     return FileResponse("frontend/dist/index.html")

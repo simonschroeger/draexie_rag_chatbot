@@ -1,36 +1,35 @@
-# Virtual Environments
+# ── Python ────────────────────────────────────────────────────────────────────
 .venv/
 venv/
 env/
-
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .pytest_cache/
 
-# Node.js
-node_modules/
+# ── Node.js ───────────────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Environment Variables
+# ── Environment variables ─────────────────────────────────────────────────────
 .env
 .env.local
 
-# Databases and Storage
+# ── Databases ─────────────────────────────────────────────────────────────────
 *.db
 *.sqlite
 *.sqlite3
 conversations.db
 draxie.db
 
-# Vector Store and Cache Data
+# ── Generated data (never commit) ────────────────────────────────────────────
 data/qdrant/
 data/qdrant_storage/
-data/cloud_cache/
-
-frontend_backup/
-data/
+data/converted_cache/
+data/images/
+data/failed_files/
+data/.vector_tmp/
